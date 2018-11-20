@@ -13,6 +13,11 @@ import (
 
 	"github.com/aliyun/aliyun-oss-go-sdk/oss"
 	"github.com/ncw/rclone/fs"
+	"github.com/ncw/rclone/fs/config/configmap"
+	"github.com/ncw/rclone/fs/config/configstruct"
+	"github.com/ncw/rclone/fs/fshttp"
+	"github.com/ncw/rclone/fs/hash"
+	"github.com/ncw/rclone/fs/walk"
 	"github.com/ncw/swift"
 	"github.com/pkg/errors"
 )
@@ -171,18 +176,24 @@ func init() {
 	})
 }
 
+// Options defines the configuration for this backend
+type Options struct {
+	EnvAuth            bool   `config:"env_auth"`
+	AccessID           string `config:"access_id"`
+	AccessKey          string `config:"access_key"`
+	Region             string `config:"region"`
+	Endpoint           string `config:"endpoint"`
+	LocationConstraint string `config:"location_constraint"`
+	ACL                string `config:"acl"`
+	StorageClass       string `config:"storage_class"`
+}
+
 // Constants
 const (
 	metaMtime      = "Mtime"                // the meta key to store mtime
 	listChunkSize  = 1000                   // number of items to read at once
 	maxRetries     = 10                     // The maximum number of retries for each operation to be performed
 	maxSizeForCopy = 5 * 1024 * 1024 * 1024 // The maximum size of object we can COPY
-)
-
-// Globals
-var (
-	ossACL          = fs.StringP("oss-acl", "", "", "Canned ACL used when creating buckets or storing objects in OSS")
-	ossStorageClass = fs.StringP("oss-storage-class", "", "", "Storage class to use when uploading OSS objects (Standard|Archive|IA)")
 )
 
 // Fs represents a remote oss server
@@ -257,20 +268,23 @@ func ossParsePath(path string) (bucket, directory string, err error) {
 
 // ossConnection makes a connection to oss
 func ossConnection(endpoint string, accessID string, accessKey string) (*oss.Client, error) {
-	client, err := oss.New(endpoint, accessID, accessKey,oss.HTTPClient(fs.Config.Client()))
+	client, err := oss.New(endpoint, accessID, accessKey, oss.HTTPClient(fshttp.NewClient(fs.Config)))
 	return client, err
 }
 
-func NewFs(name, root string) (fs.Fs, error) {
+func NewFs(name, root string, m configmap.Mapper) (fs.Fs, error) {
+	// Parse config into Options struct
+	opt := new(Options)
+	err := configstruct.Set(m, opt)
+	if err != nil {
+		return nil, err
+	}
 	bucket, directory, err := ossParsePath(root)
 	if err != nil {
 		return nil, err
 	}
-	endpoint := fs.ConfigFileGet(name, "endpoint")
-	accessID := fs.ConfigFileGet(name, "access_id")
-	accessKey := fs.ConfigFileGet(name, "access_key")
 	//Verify the account
-	c, err := ossConnection(endpoint, accessID, accessKey)
+	c, err := ossConnection(opt.Endpoint, opt.AccessID, opt.AccessKey)
 	if err != nil {
 		return nil, err
 	}
@@ -279,22 +293,15 @@ func NewFs(name, root string) (fs.Fs, error) {
 		c:                  c,
 		bucket:             bucket,    //name of the bucket
 		root:               directory, //directoy in the bucket,may be nil
-		acl:                fs.ConfigFileGet(name, "acl"),
-		locationConstraint: fs.ConfigFileGet(name, "location_constraint"),
-		storageClass:       fs.ConfigFileGet(name, "storage_class"),
+		acl:                opt.ACL,
+		locationConstraint: opt.LocationConstraint,
+		storageClass:       opt.StorageClass,
 	}
 	f.features = (&fs.Features{
 		ReadMimeType:  true,
 		WriteMimeType: true,
 		BucketBased:   true,
 	}).Fill(f)
-
-	if *ossACL != "" {
-		f.acl = *ossACL
-	}
-	if *ossStorageClass != "" {
-		f.storageClass = *ossStorageClass
-	}
 
 	if f.root != "" {
 		//Check to see if the object exists
@@ -475,7 +482,7 @@ func (f *Fs) ListR(dir string, callback fs.ListRCallback) (err error) {
 	if f.bucket == "" {
 		return fs.ErrorListBucketRequired
 	}
-	list := fs.NewListRHelper(callback)
+	list := walk.NewListRHelper(callback)
 	err = f.list(dir, true, func(remote string, object *oss.ObjectProperties, isDirectory bool) error {
 		entry, err := f.itemToDirEntry(remote, object, isDirectory)
 		if err != nil {
@@ -554,8 +561,8 @@ func (f *Fs) Precision() time.Duration {
 }
 
 // Hashes returns the supported hash sets.
-func (f *Fs) Hashes() fs.HashSet {
-	return fs.HashSet(fs.HashMD5)
+func (f *Fs) Hashes() hash.Set {
+	return hash.Set(hash.MD5)
 }
 
 // Fs returns the parent Fs
@@ -578,9 +585,9 @@ func (o *Object) Remote() string {
 var matchMd5 = regexp.MustCompile(`^[0-9a-f]{32}$`)
 
 // Hash returns the Md5sum of an object returning a lowercase hex string
-func (o *Object) Hash(t fs.HashType) (string, error) {
-	if t != fs.HashMD5 {
-		return "", fs.ErrHashUnsupported
+func (o *Object) Hash(t hash.Type) (string, error) {
+	if t != hash.MD5 {
+		return "", hash.ErrUnsupported
 	}
 	etag := strings.Trim(strings.ToLower(o.etag), `"`)
 	// Check the etag is a valid md5sum
