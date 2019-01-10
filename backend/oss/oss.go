@@ -692,26 +692,28 @@ func (o *Object) SetModTime(modTime time.Time) error {
 	if err != nil {
 		return err
 	}
-	o.meta = make(map[string]string)
-	modTimeString := swift.TimeToFloatString(modTime)
-	o.meta[metaMtime] = modTimeString
 	if o.size >= maxSizeForCopy {
 		fs.Debugf(o, "SetModTime is unsupported for objects bigger than %v bytes", fs.SizeSuffix(maxSizeForCopy))
 		return nil
 	}
-	// Guess the content type
-	mimeType := fs.MimeType(o)
 	// Copy the object to itself to update the metadata
 	key := o.fs.root + o.remote
 	sourceKey := o.fs.bucket + "/" + key
+	o.meta[metaMtime] = swift.TimeToFloatString(modTime)
+	ossOptions := []oss.Option{
+		oss.ContentType(o.mimeType),
+		oss.CopySource(o.fs.bucket, url.QueryEscape(sourceKey)),
+		oss.MetadataDirective(oss.MetaReplace),
+	}
+	for k, v := range o.meta {
+		ossOptions = append(ossOptions, oss.Meta(k, v))
+	}
 	bucket, err := o.fs.c.Bucket(o.fs.bucket)
 	if err != nil {
 		return err
 	}
-	_, erro := bucket.CopyObject(key, key, oss.ContentType(mimeType),
-		oss.CopySource(o.fs.bucket, url.QueryEscape(sourceKey)),
-		oss.MetadataDirective(oss.MetaReplace))
-	return erro
+	_, err = bucket.CopyObject(key, key, ossOptions...)
+	return err
 }
 
 // Storable returns a boolean indicating if the object is storable.
