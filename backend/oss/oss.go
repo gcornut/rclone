@@ -1,5 +1,11 @@
 package oss
 
+/* FIXME
+
+- needs pacer
+- just read f.c.Bucket once? if it is safe for concurrent reads
+*/
+
 import (
 	"fmt"
 	"io"
@@ -332,7 +338,7 @@ func (f *Fs) newObjectWithInfo(remote string, info *oss.ObjectProperties) (fs.Ob
 		o.etag = info.ETag
 		o.size = info.Size
 	} else {
-		err := o.metaData(f) // reads info and meta, returning an error
+		err := o.readMetaData(f) // reads info and meta, returning an error
 		if err != nil {
 			return nil, err
 		}
@@ -367,6 +373,14 @@ func (f *Fs) list(dir string, recurse bool, fn listFn) error {
 	bucket, _ := f.c.Bucket(f.bucket)
 	for {
 		listObjects, err := bucket.ListObjects(pre, delimiter)
+		if err != nil {
+			if ossErr, ok := err.(oss.ServiceError); ok {
+				if ossErr.StatusCode == http.StatusNotFound {
+					err = fs.ErrorDirNotFound
+				}
+			}
+			return err
+		}
 		rootLength := len(f.root)
 		if !recurse {
 			for _, commonPrefix := range listObjects.CommonPrefixes {
@@ -605,22 +619,27 @@ func (o *Object) Size() int64 {
 
 // readMetaData gets the metadata if it hasn't already been fetched
 // it also sets the info
-func (o *Object) metaData(f *Fs) (err error) {
+func (o *Object) readMetaData(f *Fs) (err error) {
 	if o.meta != nil {
 		return nil
 	}
 	key := o.fs.root + o.remote
-	archiveBucket, error1 := f.c.Bucket(o.fs.bucket)
-	if error1 != nil {
-		return error1
+	archiveBucket, err := f.c.Bucket(o.fs.bucket)
+	if err != nil {
+		return err
 	}
-	meta, error2 := archiveBucket.GetObjectDetailedMeta(key)
-	if error2 != nil {
-		return error2
+	meta, err := archiveBucket.GetObjectDetailedMeta(key)
+	if err != nil {
+		if ossErr, ok := err.(oss.ServiceError); ok {
+			if ossErr.StatusCode == http.StatusNotFound {
+				err = fs.ErrorObjectNotFound
+			}
+		}
+		return err
 	}
-	ContentLength, error3 := strconv.ParseInt(meta.Get("Content-Length"), 10, 64)
-	if error3 != nil {
-		return error3
+	ContentLength, err := strconv.ParseInt(meta.Get("Content-Length"), 10, 64)
+	if err != nil {
+		return err
 	}
 	o.size = ContentLength
 	o.meta = make(map[string]string)
@@ -647,7 +666,7 @@ func (o *Object) metaData(f *Fs) (err error) {
 // It attempts to read the objects mtime and if that isn't present the
 // LastModified returned in the http headers
 func (o *Object) ModTime() time.Time {
-	err := o.metaData(o.fs)
+	err := o.readMetaData(o.fs)
 	if err != nil {
 		fs.Logf(o, "Failed to read metadata: %v", err)
 		return time.Now()
@@ -667,7 +686,7 @@ func (o *Object) ModTime() time.Time {
 
 // SetModTime sets the modification time of the local fs object
 func (o *Object) SetModTime(modTime time.Time) error {
-	err := o.metaData(o.fs)
+	err := o.readMetaData(o.fs)
 	if err != nil {
 		return err
 	}
@@ -732,7 +751,7 @@ func (o *Object) Update(in io.Reader, src fs.ObjectInfo, options ...fs.OpenOptio
 	}
 	// Read the metadata from the newly created object
 	o.meta = nil // wipe old metadata
-	erro = o.metaData(o.fs)
+	erro = o.readMetaData(o.fs)
 	return erro
 }
 
@@ -755,7 +774,7 @@ func (o *Object) Remove() error {
 // MimeType returns the content type of the Object if known, or "" if not
 // MimeType of an Object if known, "" otherwise
 func (o *Object) MimeType() string {
-	err := o.metaData(o.fs)
+	err := o.readMetaData(o.fs)
 	if err != nil {
 		fs.Logf(o, "Failed to read metadata: %v", err)
 		return ""
