@@ -278,7 +278,9 @@ func ossParsePath(path string) (bucket, directory string, err error) {
 
 // ossConnection makes a connection to oss
 func ossConnection(endpoint string, accessID string, accessKey string) (*oss.Client, error) {
-	client, err := oss.New(endpoint, accessID, accessKey, oss.HTTPClient(fshttp.NewClient(fs.Config)))
+	client, err := oss.New(endpoint, accessID, accessKey,
+		oss.HTTPClient(fshttp.NewClient(fs.Config)),
+	)
 	return client, err
 }
 
@@ -600,6 +602,10 @@ func (f *Fs) Copy(src fs.Object, remote string) (fs.Object, error) {
 		return nil, errors.Errorf("Copy is unsupported for objects bigger than %v bytes", fs.SizeSuffix(maxSizeForCopy))
 	}
 	srcFs := srcObj.fs
+	err = srcObj.readMetaData(srcFs) // reads info and meta, returning an error
+	if err != nil {
+		return nil, err
+	}
 	key := f.root + remote
 	sourceKey := srcFs.root + srcObj.remote
 	ossOptions := []oss.Option{
@@ -834,6 +840,11 @@ func (o *Object) Open(options ...fs.OpenOption) (in io.ReadCloser, err error) {
 
 // Update the Object from in with modTime and size
 func (o *Object) Update(in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) error {
+	size := src.Size()
+	if size >= maxSizeForCopy {
+		fs.Debugf(o, "Can't upload files bigger than %v bytes yet", fs.SizeSuffix(maxSizeForCopy))
+		return nil
+	}
 	err := o.fs.Mkdir("")
 	if err != nil {
 		return err
