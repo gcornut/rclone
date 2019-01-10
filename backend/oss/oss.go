@@ -4,7 +4,6 @@ package oss
 
 - needs pacer
 - just read f.c.Bucket once? if it is safe for concurrent reads
-- server side copy
 - other optional methods?
 */
 
@@ -578,6 +577,49 @@ func (f *Fs) Precision() time.Duration {
 	return time.Nanosecond
 }
 
+// Copy src to this remote using server side copy operations.
+//
+// This is stored with the remote path given
+//
+// It returns the destination Object and a possible error
+//
+// Will only be called if src.Fs().Name() == f.Name()
+//
+// If it isn't possible then return fs.ErrorCantCopy
+func (f *Fs) Copy(src fs.Object, remote string) (fs.Object, error) {
+	err := f.Mkdir("")
+	if err != nil {
+		return nil, err
+	}
+	srcObj, ok := src.(*Object)
+	if !ok {
+		fs.Debugf(src, "Can't copy - not same remote type")
+		return nil, fs.ErrorCantCopy
+	}
+	if srcObj.size >= maxSizeForCopy {
+		return nil, errors.Errorf("Copy is unsupported for objects bigger than %v bytes", fs.SizeSuffix(maxSizeForCopy))
+	}
+	srcFs := srcObj.fs
+	key := f.root + remote
+	sourceKey := srcFs.root + srcObj.remote
+	ossOptions := []oss.Option{
+		oss.ContentType(srcObj.mimeType),
+		oss.MetadataDirective(oss.MetaReplace),
+	}
+	for k, v := range srcObj.meta {
+		ossOptions = append(ossOptions, oss.Meta(k, v))
+	}
+	bucket, err := srcFs.c.Bucket(srcFs.bucket)
+	if err != nil {
+		return nil, err
+	}
+	_, err = bucket.CopyObjectTo(f.bucket, key, sourceKey, ossOptions...)
+	if err != nil {
+		return nil, err
+	}
+	return f.NewObject(remote)
+}
+
 // Hashes returns the supported hash sets.
 func (f *Fs) Hashes() hash.Set {
 	return hash.Set(hash.MD5)
@@ -845,8 +887,8 @@ func (o *Object) MimeType() string {
 
 // Check if the interfaces are satisfied.
 var (
-	_ fs.Fs = &Fs{}
-	// _ fs.Copier      = &Fs{}
+	_ fs.Fs          = &Fs{}
+	_ fs.Copier      = &Fs{}
 	_ fs.PutStreamer = &Fs{}
 	_ fs.ListRer     = &Fs{}
 	_ fs.Object      = &Object{}
