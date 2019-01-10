@@ -380,11 +380,12 @@ func (f *Fs) list(dir string, recurse bool, fn listFn) error {
 	if !recurse {
 		delimiter = oss.Delimiter("/")
 	}
+	maxKeys := oss.MaxKeys(1000)
 	var marker oss.Option = nil
 	pre := oss.Prefix(root)
 	bucket, _ := f.c.Bucket(f.bucket)
 	for {
-		listObjects, err := bucket.ListObjects(pre, delimiter, marker)
+		listObjects, err := bucket.ListObjects(pre, delimiter, maxKeys, marker)
 		if err != nil {
 			if ossErr, ok := err.(oss.ServiceError); ok {
 				if ossErr.StatusCode == http.StatusNotFound {
