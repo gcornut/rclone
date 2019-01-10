@@ -318,7 +318,7 @@ func NewFs(name, root string, m configmap.Mapper) (fs.Fs, error) {
 	}).Fill(f)
 
 	if f.root != "" {
-		//Check to see if the object exists
+		// Check to see if the object exists
 		bucket, _ := f.c.Bucket(f.bucket)
 		objectExists, err := bucket.IsObjectExist(f.root)
 		if err == nil && objectExists {
@@ -331,6 +331,7 @@ func NewFs(name, root string, m configmap.Mapper) (fs.Fs, error) {
 			// return an error with an fs which points to the parent
 			return f, fs.ErrorIsFile
 		}
+		f.root += "/"
 	}
 	return f, nil
 }
