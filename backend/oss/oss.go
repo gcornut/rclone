@@ -5,6 +5,7 @@ package oss
 - needs pacer
 - just read f.c.Bucket once? if it is safe for concurrent reads
 - optional methods? Server side copy?
+- config.UseServerModTime
 */
 
 import (
@@ -220,16 +221,18 @@ type Fs struct {
 
 // Object describes a oss object
 type Object struct {
-	// All fields except "meta" should be assigned.
+	// Will definitely have everything but meta which may be nil
+	//
+	// List will read everything but meta - to fill that in you
+	// need to call readMetaData
 	fs           *Fs               // what this object is part of
 	remote       string            // The remote path
 	meta         map[string]string // The object metadata if known - may be nil
-	key          string            `xml:"Key"`          // the key of the object
-	mimeType     string            `xml:"Type"`         // the mimeType of the object
-	size         int64             `xml:"Size"`         // the size of the object
-	etag         string            `xml:"ETag"`         // the etag of the object
-	lastModified time.Time         `xml:"LastModified"` // the lastModified of the object
-	storageClass string            `xml:"StorageClass"` // the storageClass of the object
+	key          string            // the key of the object
+	mimeType     string            // the mimeType of the object
+	size         int64             // the size of the object
+	etag         string            // the etag of the object
+	lastModified time.Time         // the lastModified of the object
 }
 
 // Name of the remote (as passed into NewFs)
@@ -337,15 +340,10 @@ func (f *Fs) newObjectWithInfo(remote string, info *oss.ObjectProperties) (fs.Ob
 		remote: remote,
 	}
 	if info != nil {
-		// Set info but not meta
-		if &info.LastModified == nil {
-			fs.Logf(o, "Failed to read last modified")
-			o.lastModified = time.Now()
-		} else {
-			o.lastModified = info.LastModified
+		err := o.decodeMetaData(info)
+		if err != nil {
+			return nil, err
 		}
-		o.etag = info.ETag
-		o.size = info.Size
 	} else {
 		err := o.readMetaData(f) // reads info and meta, returning an error
 		if err != nil {
@@ -626,8 +624,60 @@ func (o *Object) Size() int64 {
 	return o.size
 }
 
+// decodeMetaData sets the metadata in the object from an oss.ObjectProperties
+//
+// Sets
+//  o.etag
+//  o.size
+//  o.lastModified
+//  o.mimeType
+//  o.meta = nil
+func (o *Object) decodeMetaData(info *oss.ObjectProperties) (err error) {
+	// Set info but not meta
+	o.etag = info.ETag
+	o.size = info.Size
+	o.lastModified = info.LastModified
+	o.mimeType = info.Type
+	o.meta = nil
+	return nil
+}
+
+// decodeMetaDataFromHeaders sets the metadata in the object from its headers
+//
+// Sets
+//  o.etag
+//  o.size
+//  o.lastModified
+//  o.mimeType
+//  o.meta
+func (o *Object) decodeMetaDataFromHeaders(meta http.Header) (err error) {
+	o.etag = meta.Get("ETag")
+	contentLength := meta.Get("Content-Length")
+	size, err := strconv.ParseInt(contentLength, 10, 64)
+	if err != nil {
+		return errors.Wrapf(err, "decodeMetaDataFromHeaders failed to parse Content-Length %q", contentLength)
+	}
+	o.size = size
+	lastModified := meta.Get("Last-Modified")
+	if t, err := time.Parse(http.TimeFormat, lastModified); err == nil {
+		o.lastModified = t
+	} else {
+		fs.Debugf(nil, "Couldn't parse lastmodified from %q: %v", lastModified, err)
+	}
+	o.mimeType = meta.Get("Content-Type")
+	o.meta = make(map[string]string)
+	for key, values := range meta {
+		for _, value := range values {
+			if strings.HasPrefix(key, oss.HTTPHeaderOssMetaPrefix) {
+				key := key[len(oss.HTTPHeaderOssMetaPrefix):]
+				o.meta[key] = value
+			}
+		}
+	}
+	return nil
+}
+
 // readMetaData gets the metadata if it hasn't already been fetched
-// it also sets the info
 func (o *Object) readMetaData(f *Fs) (err error) {
 	if o.meta != nil {
 		return nil
@@ -646,30 +696,7 @@ func (o *Object) readMetaData(f *Fs) (err error) {
 		}
 		return err
 	}
-	ContentLength, err := strconv.ParseInt(meta.Get("Content-Length"), 10, 64)
-	if err != nil {
-		return err
-	}
-	o.size = ContentLength
-	o.meta = make(map[string]string)
-	o.mimeType = meta.Get("Content-Type")
-	// Read metadata map
-	for key, values := range meta {
-		for _, value := range values {
-			if strings.HasPrefix(key, oss.HTTPHeaderOssMetaPrefix) {
-				key := key[len(oss.HTTPHeaderOssMetaPrefix):]
-				o.meta[key] = value
-			}
-		}
-	}
-	// Read last modified
-	lastModified := meta.Get("Last-Modified")
-	if t, err := time.Parse(http.TimeFormat, lastModified); err == nil {
-		o.lastModified = t
-	} else {
-		fs.Debugf(nil, "Couldn't parse lastmodified from %q: %v", lastModified, err)
-	}
-	return err
+	return o.decodeMetaDataFromHeaders(meta)
 }
 
 // ModTime returns the modification time of the object
@@ -780,14 +807,13 @@ func (o *Object) Update(in io.Reader, src fs.ObjectInfo, options ...fs.OpenOptio
 		ossOptions = append(ossOptions, oss.Meta(k, v))
 	}
 	ossOptions = append(ossOptions, oss.Meta(metaMtime, swift.TimeToFloatString(src.ModTime())))
-	erro := bucket.PutObject(key, in, ossOptions...)
-	if erro != nil {
-		return erro
+	err = bucket.PutObject(key, in, ossOptions...)
+	if err != nil {
+		return err
 	}
 	// Read the metadata from the newly created object
 	o.meta = nil // wipe old metadata
-	erro = o.readMetaData(o.fs)
-	return erro
+	return o.readMetaData(o.fs)
 }
 
 // Remove an object
