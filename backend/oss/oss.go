@@ -5,13 +5,15 @@ package oss
 - needs pacer
 - just read f.c.Bucket once? if it is safe for concurrent reads
 - other optional methods?
+- fix ERROR : : Entry doesn't belong in directory "" (same as directory) - ignoring in sync tests
+- chunk tester?
+- multipart uploads for files bigger than 5 GB
 */
 
 import (
 	"fmt"
 	"io"
 	"net/http"
-	"net/url"
 	"path"
 	"regexp"
 	"strconv"
@@ -781,11 +783,9 @@ func (o *Object) SetModTime(modTime time.Time) error {
 	}
 	// Copy the object to itself to update the metadata
 	key := o.fs.root + o.remote
-	sourceKey := o.fs.bucket + "/" + key
 	o.meta[metaMtime] = swift.TimeToFloatString(modTime)
 	ossOptions := []oss.Option{
 		oss.ContentType(o.mimeType),
-		oss.CopySource(o.fs.bucket, url.QueryEscape(sourceKey)),
 		oss.MetadataDirective(oss.MetaReplace),
 	}
 	for k, v := range o.meta {
