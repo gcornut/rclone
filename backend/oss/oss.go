@@ -286,6 +286,7 @@ func ossConnection(endpoint string, accessID string, accessKey string) (*oss.Cli
 	return client, err
 }
 
+// NewFs constructs an Fs from the path, bucket:path
 func NewFs(name, root string, m configmap.Mapper) (fs.Fs, error) {
 	// Parse config into Options struct
 	opt := new(Options)
@@ -381,7 +382,7 @@ func (f *Fs) list(dir string, recurse bool, fn listFn) error {
 		delimiter = oss.Delimiter("/")
 	}
 	maxKeys := oss.MaxKeys(1000)
-	var marker oss.Option = nil
+	var marker oss.Option
 	pre := oss.Prefix(root)
 	bucket, _ := f.c.Bucket(f.bucket)
 	for {
@@ -495,8 +496,15 @@ func (f *Fs) listBuckets(dir string) (entries fs.DirEntries, err error) {
 	return entries, nil
 }
 
-// Returns objects and directories list as fs.DirEntries
-// Returned entries will contain the list of all objects, however they can be placed out of order.
+// List the objects and directories in dir into entries.  The
+// entries can be returned in any order but should be for a
+// complete directory.
+//
+// dir should be "" to list the root, and should not have
+// trailing slashes.
+//
+// This should return ErrDirNotFound if the directory isn't
+// found.
 func (f *Fs) List(dir string) (entries fs.DirEntries, err error) {
 	if f.bucket == "" {
 		return f.listBuckets(dir)
@@ -504,8 +512,22 @@ func (f *Fs) List(dir string) (entries fs.DirEntries, err error) {
 	return f.listDir(dir)
 }
 
-// ListR recursively lists the objects and directories of the Fs.
-// These will not be returned in any particular order. If callback returns an error then the listing will stop immediately.
+// ListR lists the objects and directories of the Fs starting
+// from dir recursively into out.
+//
+// dir should be "" to start from the root, and should not
+// have trailing slashes.
+//
+// This should return ErrDirNotFound if the directory isn't
+// found.
+//
+// It should call callback for each tranche of entries read.
+// These need not be returned in any particular order.  If
+// callback returns an error then the listing will stop
+// immediately.
+//
+// Don't implement this unless you have a more efficient way
+// of listing recursively that doing a directory traversal.
 func (f *Fs) ListR(dir string, callback fs.ListRCallback) (err error) {
 	if f.bucket == "" {
 		return fs.ErrorListBucketRequired
@@ -524,8 +546,7 @@ func (f *Fs) ListR(dir string, callback fs.ListRCallback) (err error) {
 	return list.Flush()
 }
 
-// Function push input to the remote path.
-// sIf modTime or other parameters will be passed they will be pushed as well.
+// Put the Object into the bucket
 func (f *Fs) Put(in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) (fs.Object, error) {
 	// Temporary Object under construction
 	fs := &Object{
@@ -580,7 +601,7 @@ func (f *Fs) Rmdir(dir string) error {
 	return err
 }
 
-// Returns precision of modification time of the remote.
+// Precision of the remote
 func (f *Fs) Precision() time.Duration {
 	return time.Nanosecond
 }
@@ -650,6 +671,7 @@ func (o *Object) String() string {
 	return o.remote
 }
 
+// Remote returns the remote path
 func (o *Object) Remote() string {
 	return o.remote
 }
@@ -884,9 +906,8 @@ func (o *Object) Remove() error {
 	if isObjectExist {
 		erro := bucket.DeleteObject(key)
 		return erro
-	} else {
-		return nil
 	}
+	return nil
 }
 
 // MimeType returns the content type of the Object if known, or "" if not
