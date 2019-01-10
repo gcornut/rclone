@@ -12,6 +12,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"path"
 	"regexp"
 	"strconv"
 	"strings"
@@ -299,7 +300,7 @@ func NewFs(name, root string, m configmap.Mapper) (fs.Fs, error) {
 		name:               name, //name of the remote
 		c:                  c,
 		bucket:             bucket,    //name of the bucket
-		root:               directory, //directoy in the bucket,may be nil
+		root:               directory, //directory in the bucket,may be nil
 		acl:                opt.ACL,
 		locationConstraint: opt.LocationConstraint,
 		storageClass:       opt.StorageClass,
@@ -313,9 +314,16 @@ func NewFs(name, root string, m configmap.Mapper) (fs.Fs, error) {
 	if f.root != "" {
 		//Check to see if the object exists
 		bucket, _ := f.c.Bucket(f.bucket)
-		isObjectExist, _ := bucket.IsObjectExist(f.root)
-		if !isObjectExist {
-			f.root += "/"
+		objectExists, err := bucket.IsObjectExist(f.root)
+		if err == nil && objectExists {
+			f.root = path.Dir(directory)
+			if f.root == "." {
+				f.root = ""
+			} else {
+				f.root += "/"
+			}
+			// return an error with an fs which points to the parent
+			return f, fs.ErrorIsFile
 		}
 	}
 	return f, nil
@@ -811,7 +819,9 @@ func (o *Object) MimeType() string {
 
 // Check if the interfaces are satisfied.
 var (
-	_ fs.Fs        = &Fs{}
+	_ fs.Fs = &Fs{}
+	// _ fs.Copier      = &Fs{}
+	// _ fs.PutStreamer = &Fs{}
 	_ fs.ListRer   = &Fs{}
 	_ fs.Object    = &Object{}
 	_ fs.MimeTyper = &Object{}
