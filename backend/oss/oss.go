@@ -380,10 +380,11 @@ func (f *Fs) list(dir string, recurse bool, fn listFn) error {
 	if !recurse {
 		delimiter = oss.Delimiter("/")
 	}
+	var marker oss.Option = nil
 	pre := oss.Prefix(root)
 	bucket, _ := f.c.Bucket(f.bucket)
 	for {
-		listObjects, err := bucket.ListObjects(pre, delimiter)
+		listObjects, err := bucket.ListObjects(pre, delimiter, marker)
 		if err != nil {
 			if ossErr, ok := err.(oss.ServiceError); ok {
 				if ossErr.StatusCode == http.StatusNotFound {
@@ -432,6 +433,7 @@ func (f *Fs) list(dir string, recurse bool, fn listFn) error {
 		if !listObjects.IsTruncated {
 			break
 		}
+		marker = oss.Marker(listObjects.NextMarker)
 	}
 
 	return nil
