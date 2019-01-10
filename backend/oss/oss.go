@@ -26,7 +26,7 @@ import (
 func init() {
 	fs.Register(&fs.RegInfo{
 		Name:        "oss",
-		Description: "Aliyun oss",
+		Description: "Alibaba Cloud Object Storage Service",
 		NewFs:       NewFs,
 		Options: []fs.Option{{
 			Name: "env_auth",
@@ -213,15 +213,15 @@ type Fs struct {
 // Object describes a oss object
 type Object struct {
 	// All fields except "meta" should be assigned.
-	fs           *Fs                // what this object is part of
-	remote       string             // The remote path
-	meta         map[string]*string // The object metadata if known - may be nil
-	key          string             `xml:"Key"`          // the key of the object
-	mimeType     string             `xml:"Type"`         // the mimeType of the object
-	size         int64              `xml:"Size"`         // the size of the object
-	etag         string             `xml:"ETag"`         // the etag of the object
-	lastModified time.Time          `xml:"LastModified"` // the lastModified of the object
-	storageClass string             `xml:"StorageClass"` // the storageClass of the object
+	fs           *Fs               // what this object is part of
+	remote       string            // The remote path
+	meta         map[string]string // The object metadata if known - may be nil
+	key          string            `xml:"Key"`          // the key of the object
+	mimeType     string            `xml:"Type"`         // the mimeType of the object
+	size         int64             `xml:"Size"`         // the size of the object
+	etag         string            `xml:"ETag"`         // the etag of the object
+	lastModified time.Time         `xml:"LastModified"` // the lastModified of the object
+	storageClass string            `xml:"StorageClass"` // the storageClass of the object
 }
 
 // Name of the remote (as passed into NewFs)
@@ -623,13 +623,13 @@ func (o *Object) metaData(f *Fs) (err error) {
 		return error3
 	}
 	o.size = ContentLength
-	o.meta = make(map[string]*string)
+	o.meta = make(map[string]string)
 	// Read metadata map
 	for key, values := range meta {
 		for _, value := range values {
-			if strings.HasPrefix(value, oss.HTTPHeaderOssMetaPrefix) {
-				s := value[len(oss.HTTPHeaderOssMetaPrefix):]
-				o.meta[key] = &s
+			if strings.HasPrefix(key, oss.HTTPHeaderOssMetaPrefix) {
+				key := key[len(oss.HTTPHeaderOssMetaPrefix):]
+				o.meta[key] = value
 			}
 		}
 	}
@@ -654,10 +654,10 @@ func (o *Object) ModTime() time.Time {
 	}
 	// read mtime out of metadata if available
 	d, ok := o.meta[metaMtime]
-	if !ok || d == nil {
+	if !ok {
 		return o.lastModified
 	}
-	modTime, err := swift.FloatStringToTime(*d)
+	modTime, err := swift.FloatStringToTime(d)
 	if err != nil {
 		fs.Logf(o, "Failed to read modification time for object:: %v", err)
 		return o.lastModified
@@ -671,9 +671,9 @@ func (o *Object) SetModTime(modTime time.Time) error {
 	if err != nil {
 		return err
 	}
-	o.meta = make(map[string]*string)
+	o.meta = make(map[string]string)
 	modTimeString := swift.TimeToFloatString(modTime)
-	o.meta[metaMtime] = &modTimeString
+	o.meta[metaMtime] = modTimeString
 	if o.size >= maxSizeForCopy {
 		fs.Debugf(o, "SetModTime is unsupported for objects bigger than %v bytes", fs.SizeSuffix(maxSizeForCopy))
 		return nil
@@ -723,8 +723,9 @@ func (o *Object) Update(in io.Reader, src fs.ObjectInfo, options ...fs.OpenOptio
 	key := o.fs.root + o.remote
 	ossOptions := []oss.Option{oss.ContentType(mimeType)}
 	for k, v := range o.meta {
-		ossOptions = append(ossOptions, oss.Meta(k, *v))
+		ossOptions = append(ossOptions, oss.Meta(k, v))
 	}
+	ossOptions = append(ossOptions, oss.Meta(metaMtime, swift.TimeToFloatString(src.ModTime())))
 	erro := bucket.PutObject(key, in, ossOptions...)
 	if erro != nil {
 		return erro
