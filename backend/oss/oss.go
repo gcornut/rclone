@@ -4,7 +4,8 @@ package oss
 
 - needs pacer
 - just read f.c.Bucket once? if it is safe for concurrent reads
-- optional methods? Server side copy?
+- server side copy
+- other optional methods?
 - config.UseServerModTime
 */
 
@@ -521,19 +522,16 @@ func (f *Fs) ListR(dir string, callback fs.ListRCallback) (err error) {
 // sIf modTime or other parameters will be passed they will be pushed as well.
 func (f *Fs) Put(in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) (fs.Object, error) {
 	// Temporary Object under construction
-	if f.root != "" {
-		fs := &Object{
-			fs:     f,
-			remote: src.Remote(),
-		}
-		return fs, fs.Update(in, src, options...)
-	} else {
-		fs := &Object{
-			fs:     f,
-			remote: f.root + src.Remote(),
-		}
-		return fs, fs.Update(in, src, options...)
+	fs := &Object{
+		fs:     f,
+		remote: src.Remote(),
 	}
+	return fs, fs.Update(in, src, options...)
+}
+
+// PutStream uploads to the remote path with the modTime given of indeterminate size
+func (f *Fs) PutStream(in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) (fs.Object, error) {
+	return f.Put(in, src, options...)
 }
 
 // NB this can return incorrect results if called immediately after bucket deletion
@@ -847,8 +845,8 @@ func (o *Object) MimeType() string {
 var (
 	_ fs.Fs = &Fs{}
 	// _ fs.Copier      = &Fs{}
-	// _ fs.PutStreamer = &Fs{}
-	_ fs.ListRer   = &Fs{}
-	_ fs.Object    = &Object{}
-	_ fs.MimeTyper = &Object{}
+	_ fs.PutStreamer = &Fs{}
+	_ fs.ListRer     = &Fs{}
+	_ fs.Object      = &Object{}
+	_ fs.MimeTyper   = &Object{}
 )
