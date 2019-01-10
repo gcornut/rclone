@@ -28,7 +28,6 @@ import (
 	"github.com/ncw/rclone/fs/fshttp"
 	"github.com/ncw/rclone/fs/hash"
 	"github.com/ncw/rclone/fs/walk"
-	"github.com/ncw/swift"
 	"github.com/pkg/errors"
 )
 
@@ -200,7 +199,9 @@ type Options struct {
 
 // Constants
 const (
-	metaMtime      = "Mtime"                // the meta key to store mtime
+	metaMtime      = "Mtime" // the meta key to store mtime
+	timeFormatIn   = time.RFC3339
+	timeFormatOut  = "2006-01-02T15:04:05.000000000Z07:00"
 	listChunkSize  = 1000                   // number of items to read at once
 	maxRetries     = 10                     // The maximum number of retries for each operation to be performed
 	maxSizeForCopy = 5 * 1024 * 1024 * 1024 // The maximum size of object we can COPY
@@ -789,9 +790,9 @@ func (o *Object) ModTime() time.Time {
 	if !ok {
 		return o.lastModified
 	}
-	modTime, err := swift.FloatStringToTime(d)
+	modTime, err := time.Parse(timeFormatIn, d)
 	if err != nil {
-		fs.Logf(o, "Failed to read modification time for object:: %v", err)
+		fs.Debugf(o, "Couldn't parse modification time from %q: %v", d, err)
 		return o.lastModified
 	}
 	return modTime
@@ -809,7 +810,7 @@ func (o *Object) SetModTime(modTime time.Time) error {
 	}
 	// Copy the object to itself to update the metadata
 	key := o.fs.root + o.remote
-	o.meta[metaMtime] = swift.TimeToFloatString(modTime)
+	o.meta[metaMtime] = modTime.Format(timeFormatOut)
 	ossOptions := []oss.Option{
 		oss.ContentType(o.mimeType),
 		oss.MetadataDirective(oss.MetaReplace),
@@ -885,7 +886,7 @@ func (o *Object) Update(in io.Reader, src fs.ObjectInfo, options ...fs.OpenOptio
 	for k, v := range o.meta {
 		ossOptions = append(ossOptions, oss.Meta(k, v))
 	}
-	ossOptions = append(ossOptions, oss.Meta(metaMtime, swift.TimeToFloatString(src.ModTime())))
+	ossOptions = append(ossOptions, oss.Meta(metaMtime, src.ModTime().Format(timeFormatOut)))
 	err = bucket.PutObject(key, in, ossOptions...)
 	if err != nil {
 		return err
