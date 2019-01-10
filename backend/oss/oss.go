@@ -6,7 +6,6 @@ package oss
 - just read f.c.Bucket once? if it is safe for concurrent reads
 - server side copy
 - other optional methods?
-- config.UseServerModTime
 */
 
 import (
@@ -701,6 +700,9 @@ func (o *Object) readMetaData(f *Fs) (err error) {
 // It attempts to read the objects mtime and if that isn't present the
 // LastModified returned in the http headers
 func (o *Object) ModTime() time.Time {
+	if fs.Config.UseServerModTime {
+		return o.lastModified
+	}
 	err := o.readMetaData(o.fs)
 	if err != nil {
 		fs.Logf(o, "Failed to read metadata: %v", err)
