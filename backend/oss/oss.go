@@ -721,7 +721,30 @@ func (o *Object) Storable() bool {
 func (o *Object) Open(options ...fs.OpenOption) (in io.ReadCloser, err error) {
 	key := o.fs.root + o.remote
 	bucket, _ := o.fs.c.Bucket(o.fs.bucket)
-	resp, err := bucket.GetObject(key)
+	opts := []oss.Option{}
+	for _, option := range options {
+		switch x := option.(type) {
+		case *fs.SeekOption:
+			value := strconv.FormatInt(x.Offset, 10)
+			opts = append(opts, oss.NormalizedRange(value+"-"))
+		case *fs.RangeOption:
+			value := ""
+			if x.Start >= 0 {
+				value += strconv.FormatInt(x.Start, 10)
+
+			}
+			value += "-"
+			if x.End >= 0 && x.End <= o.size {
+				value += strconv.FormatInt(x.End, 10)
+			}
+			opts = append(opts, oss.NormalizedRange(value))
+		default:
+			if option.Mandatory() {
+				fs.Logf(o, "Unsupported mandatory option: %v", option)
+			}
+		}
+	}
+	resp, err := bucket.GetObject(key, opts...)
 	if err != nil {
 		return nil, err
 	}
