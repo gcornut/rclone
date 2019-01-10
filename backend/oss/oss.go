@@ -4,6 +4,7 @@ package oss
 
 - needs pacer
 - just read f.c.Bucket once? if it is safe for concurrent reads
+- optional methods? Server side copy?
 */
 
 import (
@@ -643,6 +644,7 @@ func (o *Object) readMetaData(f *Fs) (err error) {
 	}
 	o.size = ContentLength
 	o.meta = make(map[string]string)
+	o.mimeType = meta.Get("Content-Type")
 	// Read metadata map
 	for key, values := range meta {
 		for _, value := range values {
