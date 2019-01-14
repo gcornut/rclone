@@ -11,18 +11,24 @@ import (
 	"github.com/ncw/rclone/lib/rest"
 	"github.com/pkg/errors"
 	"io"
+	"net/http"
 	"net/url"
 	"path"
-	"strings"
 	"time"
 )
+
+// TODO: configure integration tests
+// TODO: implement optional Fs interfaces
+// TODO: implement IPFS hash
+// TODO: implement read access to `/ipfs/<HASH>` paths
+// TODO: implement read/write access to `/ipns/<HASH>` paths
 
 // Register with Fs
 
 func init() {
 	fsi := &fs.RegInfo{
 		Name:        "ipfs",
-		Description: "ipfs files api",
+		Description: "IPFS files api",
 		NewFs:       NewFs,
 		Options: []fs.Option{{
 			Name:     "url",
@@ -58,8 +64,20 @@ func NewFs(name, root string, m configmap.Mapper) (fs.Fs, error) {
 		CaseInsensitive:         true,
 		CanHaveEmptyDirectories: true,
 	}).Fill(f)
+	f.srv.SetErrorHandler(errorHandler)
 
 	return f, nil
+}
+
+// errorHandler parses a non 2xx error response into an error
+func errorHandler(resp *http.Response) error {
+	// Decode error response
+	errResponse := new(api.Error)
+	err := rest.DecodeJSON(resp, &errResponse)
+	if err != nil {
+		fs.Debugf(nil, "Couldn't decode error response: %v", err)
+	}
+	return errResponse
 }
 
 // Options defines the configuration for this backend
@@ -110,55 +128,12 @@ func (f *Fs) Features() *fs.Features {
 
 // Hashes returns the supported hash sets.
 func (f *Fs) Hashes() hash.Set {
-	return hash.Set(hash.SHA1)
+	return hash.Set(hash.None)
 }
 
 // Precision return the precision of this Fs
 func (f *Fs) Precision() time.Duration {
 	return time.Second
-}
-
-func (f *Fs) filesStat(file string) (stat *api.FileStat, err error) {
-	if !strings.HasPrefix(file, "/") {
-		file = "/" + file
-	}
-	opts := rest.Opts{
-		Method:     "GET",
-		Path:       "/api/v0/files/stat",
-		Parameters: url.Values{
-			"arg": []string{file},
-		},
-	}
-
-	var result api.FileStat
-	resp, err := f.srv.CallJSON(&opts, nil, &result)
-	if err != nil {
-		fmt.Println(resp)
-		return nil, err
-	}
-	return &result, nil
-}
-
-func (f * Fs) filesList(dir string) (fileEntries *api.FileList, err error) {
-	arg := dir
-	if !strings.HasPrefix(dir, "/") {
-		arg = "/" + arg
-	}
-
-	opts := rest.Opts{
-		Method:     "GET",
-		Path:       "/api/v0/files/ls",
-		Parameters: url.Values{
-			"arg": []string{arg},
-		},
-	}
-
-	var result api.FileList
-	_, err = f.srv.CallJSON(&opts, nil, &result)
-	if err != nil {
-		return nil, err
-	}
-	return &result, nil
 }
 
 // List the objects and directories in dir into entries.  The
@@ -168,11 +143,14 @@ func (f * Fs) filesList(dir string) (fileEntries *api.FileList, err error) {
 // dir should be "" to list the root, and should not have
 // trailing slashes.
 //
-// This should return ErrDirNotFound if the directory isn't
+// This should return ErrorDirNotFound if the directory isn't
 // found.
 func (f *Fs) List(dir string) (entries fs.DirEntries, err error) {
-	result, err := f.filesList(path.Join(f.root, dir))
+	result, err := api.FilesList(f.srv, path.Join(f.root, dir))
 	if err != nil {
+		if apiError, ok := err.(*api.Error); ok && apiError.Message == "file does not exist" {
+			return nil, fs.ErrorDirNotFound
+		}
 		return nil, err
 	}
 
@@ -180,12 +158,7 @@ func (f *Fs) List(dir string) (entries fs.DirEntries, err error) {
 		remote := path.Join(dir, entry.Name)
 		modTime := time.Unix(0, 0)
 
-		stat, err := f.filesStat(path.Join(f.root, remote))
-		if err != nil {
-			return nil, err
-		}
-
-		if stat.Type == "directory" {
+		if entry.Type == api.FileEntryTypeFolder {
 			d := fs.NewDir(remote, modTime)
 			entries = append(entries, d)
 		} else {
@@ -193,7 +166,7 @@ func (f *Fs) List(dir string) (entries fs.DirEntries, err error) {
 				fs:      f,
 				remote:  remote,
 				modTime: modTime,
-				size: int64(stat.Size),
+				size:    int64(entry.Size),
 			}
 			entries = append(entries, o)
 		}
@@ -205,9 +178,17 @@ func (f *Fs) List(dir string) (entries fs.DirEntries, err error) {
 // NewObject finds the Object at remote.  If it can't be found
 // it returns the error fs.ErrorObjectNotFound.
 func (f *Fs) NewObject(remote string) (fs.Object, error) {
+	stat, err := api.FilesStat(f.srv, path.Join(f.root, remote))
+	if err != nil {
+		if apiError, ok := err.(*api.Error); ok && apiError.Message == "file does not exist" {
+			return nil, fs.ErrorObjectNotFound
+		}
+		return nil, err
+	}
 	o := &Object{
 		fs:     f,
 		remote: remote,
+		size:   int64(stat.Size),
 	}
 	return o, nil
 }
@@ -218,22 +199,60 @@ func (f *Fs) NewObject(remote string) (fs.Object, error) {
 //
 // The new object may have been created if an error is returned
 func (f *Fs) Put(in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) (fs.Object, error) {
-	panic("implement me")
+	_, file := path.Split(src.Remote())
+	fileAdded, err := api.Add(f.srv, in, file)
+	if err != nil {
+		return nil, err
+	}
+	err = api.FilesCp(f.srv, "/ipfs/"+fileAdded.Hash, src.Remote())
+	if err != nil {
+		return nil, err
+	}
+	o, err := f.NewObject(fileAdded.Name)
+	if err != nil {
+		return nil, err
+	}
+	return o, nil
 }
 
 // Mkdir creates the container if it doesn't exist
 func (f *Fs) Mkdir(dir string) error {
-	panic("implement me")
-
+	return api.FilesMkdir(f.srv, dir)
 }
 
-// Rmdir deletes the root folder
+// Rmdir deletes the root folder (emulated with files/rm, files/stat and files/ls)
 //
-// Returns an error if it isn't empty
+// Returns ErrorDirectoryNotEmpty if it isn't empty
 func (f *Fs) Rmdir(dir string) error {
-	panic("implement me")
-}
+	dirPath := path.Join(f.root, dir)
 
+	stat, err := api.FilesStat(f.srv, dirPath)
+	if err != nil {
+		if apiError, ok := err.(*api.Error); ok && apiError.Message == "file does not exist" {
+			return fs.ErrorDirNotFound
+		}
+		return err
+	}
+	// Should not be a file
+	if stat.Type == api.FileStatTypeFile {
+		return fs.ErrorIsFile
+	}
+
+	list, err := f.List(dir)
+	if err != nil {
+		return err
+	}
+	// Should not have children
+	if list.Len() > 0 {
+		return fs.ErrorDirectoryNotEmpty
+	}
+
+	err = api.FilesRm(f.srv, dirPath)
+	if err != nil {
+		return err
+	}
+	return nil
+}
 
 // ------------------------------------------------------------
 
@@ -257,7 +276,7 @@ func (o *Object) Remote() string {
 
 // Hash returns the SHA-1 of an object returning a lowercase hex string
 func (o *Object) Hash(t hash.Type) (string, error) {
-	panic("implement me")
+	return "", hash.ErrUnsupported
 }
 
 // Size returns the size of an object in bytes
@@ -290,17 +309,17 @@ func (o *Object) Open(options ...fs.OpenOption) (in io.ReadCloser, err error) {
 // If existing is set then it updates the object rather than creating a new one
 //
 // The new object may have been created if an error is returned
-func (o *Object) Update(in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) (err error) {
-	panic("implement me")
+func (o *Object) Update(in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) error {
+	return api.FilesWrite(o.fs.srv, o.remote, in)
 }
 
 // Remove an object
 func (o *Object) Remove() error {
-	panic("implement me")
+	return api.FilesRm(o.fs.srv, o.remote)
 }
 
 // Check the interfaces are satisfied
 var (
-	_ fs.Fs          = &Fs{}
-	_ fs.Object      = &Object{}
+	_ fs.Fs     = &Fs{}
+	_ fs.Object = &Object{}
 )
