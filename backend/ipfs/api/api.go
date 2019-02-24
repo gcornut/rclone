@@ -6,10 +6,8 @@ import (
 	"io"
 	"net/http"
 	"net/url"
-	"path"
+	"strconv"
 )
-
-// TODO: Add all of this in github.com/ipfs/go-ipfs-api (and add go-ipfs-api as a dependency for rclone)
 
 type Api struct {
 	srv *rest.Client // the connection to the server
@@ -34,42 +32,9 @@ func errorHandler(resp *http.Response) error {
 	return errResponse
 }
 
-// /api/v0/files/stat
-func (a *Api) FilesStat(file string) (result *FileStat, err error) {
-	opts := rest.Opts{
-		Method: "GET",
-		Path:   "/api/v0/files/stat",
-		Parameters: url.Values{
-			"arg": []string{file},
-		},
-	}
-	_, err = a.srv.CallJSON(&opts, nil, &result)
-	if err != nil {
-		return nil, err
-	}
-	return result, nil
-}
-
-// /api/v0/files/ls
-func (a *Api) FilesList(dir string) (fileEntries *FileList, err error) {
-	opts := rest.Opts{
-		Method: "GET",
-		Path:   "/api/v0/files/ls",
-		Parameters: url.Values{
-			"arg": []string{dir},
-			"l":   []string{"true"},
-			"U":   []string{"true"},
-		},
-	}
-	_, err = a.srv.CallJSON(&opts, nil, &fileEntries)
-	if err != nil {
-		return nil, err
-	}
-	return fileEntries, nil
-}
-
+// Add file to IPFS
 // /api/v0/add
-func (a *Api) Add(in io.Reader, name string) (result *FileAdded, err error) {
+func (a *Api) Add(in io.Reader, name string, options ...fs.OpenOption) (result *FileAdded, err error) {
 	opts := rest.Opts{
 		Method:               "POST",
 		Path:                 "/api/v0/add",
@@ -80,6 +45,7 @@ func (a *Api) Add(in io.Reader, name string) (result *FileAdded, err error) {
 		Parameters: url.Values{
 			"pin": []string{"false"},
 		},
+		Options: options,
 	}
 	_, err = a.srv.CallJSON(&opts, nil, &result)
 	if err != nil {
@@ -88,92 +54,69 @@ func (a *Api) Add(in io.Reader, name string) (result *FileAdded, err error) {
 	return result, nil
 }
 
-// /api/v0/files/write
-func (a *Api) FilesWrite(file string, in io.Reader) error {
-	_, fileName := path.Split(file)
-	opts := rest.Opts{
-		Method: "POST",
-		Path:   "/api/v0/files/write",
-		Parameters: url.Values{
-			"arg":      []string{file},
-			"truncate": []string{"true"},
-		},
-		MultipartParams:      url.Values{},
-		MultipartContentName: "file",
-		MultipartFileName:    fileName,
-		Body:                 in,
-	}
-	_, err := a.srv.CallJSON(&opts, nil, nil)
-	return err
-}
-
-// /api/v0/files/cp
-func (a *Api) FilesCp(from string, to string) error {
+// List file in IPFS path
+// /api/v0/ls
+func (a *Api) Ls(path string) ([]Link, error) {
 	opts := rest.Opts{
 		Method: "GET",
-		Path:   "/api/v0/files/cp",
+		Path:   "/api/v0/ls",
 		Parameters: url.Values{
-			"arg": []string{from, to},
+			"arg": []string{path},
 		},
 	}
-	_, err := a.srv.Call(&opts)
+	var result List
+	_, err := a.srv.CallJSON(&opts, nil, &result)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	return nil
+	// Only one path provided so we get the first object links
+	return result.Objects[0].Links, nil
 }
 
-// /api/v0/files/mkdir
-func (a *Api) FilesMkdir(dir string) error {
+// Read file in IPFS path
+// /api/v0/cat
+func (a *Api) Cat(objectPath string, objectSize int64, options ...fs.OpenOption) (result io.ReadCloser, err error) {
 	opts := rest.Opts{
 		Method: "GET",
-		Path:   "/api/v0/files/mkdir",
-		Parameters: url.Values{
-			"arg": []string{dir},
-		},
-	}
-	_, err := a.srv.Call(&opts)
-	if err != nil {
-		return err
-	}
-	return nil
-}
-
-// /api/v0/files/rm
-func (a *Api) FilesRm(dir string) error {
-	opts := rest.Opts{
-		Method: "GET",
-		Path:   "/api/v0/files/rm",
-		Parameters: url.Values{
-			"arg":       []string{dir},
-			"recursive": []string{"true"},
-		},
-	}
-	_, err := a.srv.Call(&opts)
-	if err != nil {
-		return err
-	}
-	return nil
-}
-
-// /api/v0/object/links
-func (a *Api) ObjectLinks(objectPath string) (result *Links, err error) {
-	opts := rest.Opts{
-		Method: "GET",
-		Path:   "/api/v0/object/links",
+		Path:   "/api/v0/cat",
 		Parameters: url.Values{
 			"arg": []string{objectPath},
 		},
+		Options: options,
 	}
-	_, err = a.srv.CallJSON(&opts, nil, &result)
+
+	for _, option := range options {
+		seekOption, isSeek := option.(*fs.SeekOption)
+		if isSeek {
+			offset := strconv.FormatInt(seekOption.Offset, 10)
+			opts.Parameters.Add("offset", offset)
+		}
+		rangeOption, isRange := option.(*fs.RangeOption)
+		if isRange {
+			if rangeOption.Start < 0 {
+				offset := strconv.FormatInt(objectSize-rangeOption.End, 10)
+				opts.Parameters.Add("offset", offset)
+			} else {
+				offset := strconv.FormatInt(rangeOption.Start, 10)
+				opts.Parameters.Add("offset", offset)
+
+				if rangeOption.End > rangeOption.Start {
+					length := strconv.FormatInt(rangeOption.End-rangeOption.Start+1, 10)
+					opts.Parameters.Add("length", length)
+				}
+			}
+		}
+	}
+	resp, err := a.srv.Call(&opts)
 	if err != nil {
 		return nil, err
 	}
-	return result, nil
+	return resp.Body, nil
 }
 
+// Get IPFS DAG object stat
 // /api/v0/object/stat
-func (a *Api) ObjectStat(objectPath string) (result *Stat, err error) {
+func (a *Api) ObjectStat(objectPath string) (result *ObjectStat, err error) {
 	opts := rest.Opts{
 		Method: "GET",
 		Path:   "/api/v0/object/stat",
@@ -188,7 +131,8 @@ func (a *Api) ObjectStat(objectPath string) (result *Stat, err error) {
 	return result, nil
 }
 
-// /api/v0/object/patch/add-lin
+// Patch a IPFS DAG object by adding (or replacing) a link.
+// /api/v0/object/patch/add-link
 func (a *Api) ObjectPatchAddLink(rootHash string, path string, linkHash string) (result *HasHash, err error) {
 	opts := rest.Opts{
 		Method: "GET",
@@ -207,6 +151,7 @@ func (a *Api) ObjectPatchAddLink(rootHash string, path string, linkHash string) 
 	return result, nil
 }
 
+// Patch a IPFS DAG object by removing a link.
 // /api/v0/object/patch/rm-link
 func (a *Api) ObjectPatchRmLink(rootHash string, path string) (result *HasHash, err error) {
 	opts := rest.Opts{
@@ -225,6 +170,7 @@ func (a *Api) ObjectPatchRmLink(rootHash string, path string) (result *HasHash, 
 	return result, nil
 }
 
+// Create a new empty dir IPFS DAG object
 // /api/v0/object/new
 func (a *Api) ObjectNewDir() (result *HasHash, err error) {
 	opts := rest.Opts{
@@ -241,25 +187,9 @@ func (a *Api) ObjectNewDir() (result *HasHash, err error) {
 	return result, nil
 }
 
-// /api/v0/object/data
-func (a *Api) ObjectData(objectPath string, options ...fs.OpenOption) (result io.ReadCloser, err error) {
-	opts := rest.Opts{
-		Method: "GET",
-		Path:   "/api/v0/object/data",
-		Parameters: url.Values{
-			"arg": []string{objectPath},
-		},
-		Options: options,
-	}
-	resp, err := a.srv.Call(&opts)
-	if err != nil {
-		return nil, err
-	}
-	return resp.Body, nil
-}
-
+// Diff two IPFS DAG object
 // /api/v0/object/diff
-func (a *Api) ObjectDiff(object1 string, object2 string) (result *Diff, err error) {
+func (a *Api) ObjectDiff(object1 string, object2 string) (result *ObjectDiff, err error) {
 	opts := rest.Opts{
 		Method: "GET",
 		Path:   "/api/v0/object/diff",
@@ -274,13 +204,14 @@ func (a *Api) ObjectDiff(object1 string, object2 string) (result *Diff, err erro
 	return result, nil
 }
 
-// /api/v0/ls
-func (a *Api) Ls(path string) (result *Objects, err error) {
+// Get file stat in IPFS MFS
+// /api/v0/files/stat
+func (a *Api) FilesStat(file string) (result *HasHash, err error) {
 	opts := rest.Opts{
 		Method: "GET",
-		Path:   "/api/v0/ls",
+		Path:   "/api/v0/files/stat",
 		Parameters: url.Values{
-			"arg": []string{path},
+			"arg": []string{file},
 		},
 	}
 	_, err = a.srv.CallJSON(&opts, nil, &result)
@@ -288,4 +219,39 @@ func (a *Api) Ls(path string) (result *Objects, err error) {
 		return nil, err
 	}
 	return result, nil
+}
+
+// Copy IPFS file to IPFS MFS
+// /api/v0/files/cp
+func (a *Api) FilesCp(from string, to string) error {
+	opts := rest.Opts{
+		Method: "GET",
+		Path:   "/api/v0/files/cp",
+		Parameters: url.Values{
+			"arg": []string{from, to},
+		},
+	}
+	_, err := a.srv.Call(&opts)
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
+// Remove a IPFS MFS file
+// /api/v0/files/rm
+func (a *Api) FilesRm(dir string) error {
+	opts := rest.Opts{
+		Method: "GET",
+		Path:   "/api/v0/files/rm",
+		Parameters: url.Values{
+			"arg":       []string{dir},
+			"recursive": []string{"true"},
+		},
+	}
+	_, err := a.srv.Call(&opts)
+	if err != nil {
+		return err
+	}
+	return nil
 }
