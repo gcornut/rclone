@@ -255,3 +255,17 @@ func (a *Api) FilesRm(dir string) error {
 	}
 	return nil
 }
+
+// IPFS repo garbage collecting
+// /api/v0/repo/gc
+func (a *Api) RepoGc() error {
+	opts := rest.Opts{
+		Method: "GET",
+		Path:   "/api/v0/repo/gc",
+	}
+	_, err := a.srv.Call(&opts)
+	if err != nil {
+		return err
+	}
+	return nil
+}

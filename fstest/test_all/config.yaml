@@ -41,6 +41,10 @@ backends:
    remote:   "TestHubic:"
    subdir:   false
    fastlist: false
+ - backend:  "ipfs"
+   remote:   "TestIPFS:"
+   subdir:   false
+   fastlist: false
  - backend:  "jottacloud"
    remote:   "TestJottacloud:"
    subdir:   false

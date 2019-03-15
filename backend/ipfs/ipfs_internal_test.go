@@ -56,16 +56,16 @@ func TestIPFSInternal(t *testing.T) {
 		// Test larger file (that are stored in chunks in IPFS)
 
 		// 1 max size chunk and a 1 byte chunk
-		testFileSizeConserved(t, f, IpfsMaxChunkSize+1)
+		testFileSizeConserved(t, f, MaxChunkSize+1)
 
 		// 2 max size chunk
-		testFileSizeConserved(t, f, IpfsMaxChunkSize*2)
+		testFileSizeConserved(t, f, MaxChunkSize*2)
 
 		// 2 max size chunk and 122 bytes chunk
-		testFileSizeConserved(t, f, (IpfsMaxChunkSize*2)+122)
+		testFileSizeConserved(t, f, (MaxChunkSize*2)+122)
 
 		// 3 max size chunk and 16376 bytes chunk
-		testFileSizeConserved(t, f, (IpfsMaxChunkSize*3)+16376)
+		testFileSizeConserved(t, f, (MaxChunkSize*3)+16376)
 
 		// Random size
 		//testFileSizeConserved(t, f, rand.Int63n(10000000))

@@ -13,6 +13,7 @@ import (
 	"io"
 	"path"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -46,11 +47,130 @@ func init() {
 
 // Max size of a IPFS object data after which the IPFS chunker will
 // chunk the original file
-const IpfsMaxChunkSize = int64(262144)
+const MaxChunkSize = int64(262144)
+
+type SharedRoots struct {
+	sync.RWMutex
+
+	// Map from ENDPOINT:IPFS_PATH to IPFS Root
+	// example of map key "http://localhost:5001:/"
+	// => IPFS MFS on local IPFS node
+	cache map[string]*Root
+}
+
+type Root struct {
+	sync.RWMutex
+	api         *api.Api
+	initialHash string
+	hash        string
+	log         func(text string, args ...interface{})
+}
+
+func NewRoot(f *Fs, ipfsPath string) (*Root, error) {
+	stat, err := f.api.FilesStat(ipfsPath)
+	if err != nil {
+		return nil, err
+	}
+
+	r := Root{
+		api:         f.api,
+		initialHash: stat.Hash,
+		hash:        stat.Hash,
+		log: func(text string, args ...interface{}) {
+			fs.Logf(f, text, args...)
+		},
+	}
+
+	// Persist Fs changes to IPFS MFS on program exit
+	atexit.Register(r.persistToMFS)
+
+	// Also persist periodically
+	r.periodicPersist()
+	return &r, nil
+}
+
+// Persist modified IPFS DAG to IPFS MFS
+func (r *Root) persistToMFS() {
+	r.Lock()
+	defer r.Unlock()
+	if r.hash == r.initialHash {
+		return
+	}
+
+	// Make sure the IPFS MFS was not modified concurrently in the background
+	stat, err := r.api.FilesStat("/")
+	if err != nil {
+		panic(err)
+	}
+
+	// List differences before and after rclone operations
+	diff, err := r.api.ObjectDiff(r.initialHash, r.hash)
+	if err != nil {
+		panic(err)
+	}
+
+	if stat.Hash != r.initialHash {
+		externalDiff, err := r.api.ObjectDiff(stat.Hash, r.initialHash)
+		if err != nil {
+			panic(err)
+		}
+
+		listChangedPath := func(changes []api.ObjectChange) (paths []string) {
+			for _, change := range changes {
+				paths = append(paths, change.Path)
+			}
+			return paths
+		}
+		externalChangedPaths := listChangedPath(externalDiff.Changes)
+		localChangedPaths := listChangedPath(diff.Changes)
+
+		for _, externalChangedPath := range externalChangedPaths {
+			for _, localChangedPath := range localChangedPaths {
+				if strings.HasPrefix(externalChangedPath, localChangedPath) ||
+					strings.HasPrefix(localChangedPath, externalChangedPath) {
+					panic("Error: concurrent modification of the IPFS MFS. Consistency not guaranteed.")
+				}
+			}
+		}
+	}
+
+	// Persist changes to IPFS MFS
+	for _, change := range diff.Changes {
+		if change.Before != nil {
+			err := r.api.FilesRm("/" + change.Path)
+			if err != nil {
+				panic(err)
+			}
+		}
+		if change.After != nil {
+			absolutePath := "/ipfs/" + change.After["/"]
+			err := r.api.FilesCp(absolutePath, "/"+change.Path)
+			if err != nil {
+				panic(err)
+			}
+		}
+	}
+	r.log("Persisted root hash %s in IPFS MFS", r.hash)
+
+	stat, err = r.api.FilesStat("/")
+	if err != nil {
+		panic(err)
+	}
+	r.initialHash = stat.Hash
+	r.hash = stat.Hash
+}
+
+func (r *Root) periodicPersist() {
+	nextTime := time.Now().Add(PersistPeriod)
+	time.Sleep(time.Until(nextTime))
+	r.persistToMFS()
+	go r.periodicPersist()
+}
 
 var (
 	DefaultTime   = time.Unix(0, 0)
-	rootHashCache = make(map[string]string)
+	PersistPeriod = time.Second
+	sharedRoot    = &SharedRoots{cache: make(map[string]*Root)}
 )
 
 // ------------------------------------------------------------
@@ -62,14 +182,13 @@ type Options struct {
 
 // Fs stores the interface to the remote HTTP files
 type Fs struct {
-	name            string
-	root            string
-	features        *fs.Features // optional features
-	opt             Options      // options for this backend
-	api             *api.Api     // the connection to the server
-	_rootHash       string       // IPFS hash of the root
-	initialRootHash string
-	_emptyDirHash   string // IPFS hash of an empty dir
+	name          string
+	root          string
+	features      *fs.Features // optional features
+	opt           Options      // options for this backend
+	api           *api.Api     // the connection to the server
+	ipfsRoot      *Root
+	_emptyDirHash string // IPFS hash of an empty dir
 }
 
 // Object is a remote object that has been stat'd (so it exists, but is not necessarily open for reading)
@@ -99,18 +218,23 @@ func NewFs(name string, root string, m configmap.Mapper) (fs.Fs, error) {
 		api:  api.NewApi(client, opt.Endpoint),
 	}
 	f.features = (&fs.Features{
-		CaseInsensitive:         true,
 		CanHaveEmptyDirectories: true,
 	}).Fill(f)
 
-	// Initialize IPFS root HASH
-	err = f.initializeRootHash()
-	if err != nil {
-		return nil, err
-	}
+	ipfsPath := "/" // for IPFS MFS (will change for IPNS)
 
-	// Persist Fs changes to IPFS MFS on program exit
-	atexit.Register(f.persistToMFS)
+	sharedRoot.Lock()
+	ipfsRootKey := opt.Endpoint + ":" + ipfsPath
+	ipfsRoot := sharedRoot.cache[ipfsRootKey]
+	if ipfsRoot == nil {
+		ipfsRoot, err = NewRoot(f, ipfsPath)
+		if err != nil {
+			return nil, err
+		}
+		sharedRoot.cache[ipfsRootKey] = ipfsRoot
+	}
+	f.ipfsRoot = ipfsRoot
+	sharedRoot.Unlock()
 
 	var fsError error = nil
 	if root != "" {
@@ -138,23 +262,6 @@ func NewFs(name string, root string, m configmap.Mapper) (fs.Fs, error) {
 	return f, fsError
 }
 
-func (f *Fs) initializeRootHash() error {
-	cachedRootHash, ok := rootHashCache["/"]
-	if ok {
-		f._rootHash = cachedRootHash
-	}
-	if f._rootHash == "" {
-		stat, err := f.api.FilesStat("/")
-		if err != nil {
-			return err
-		}
-		f._rootHash = stat.Hash
-		rootHashCache["/"] = stat.Hash
-	}
-	f.initialRootHash = f._rootHash
-	return nil
-}
-
 // Get or fetch the IPFS empty directory hash
 func (f *Fs) emptyDirHash() (string, error) {
 	if f._emptyDirHash == "" {
@@ -176,16 +283,15 @@ func (f *Fs) relativePath(remote string) (relativePath string) {
 	return relativePath
 }
 
-func (f *Fs) absolutePath(remote string) (relativePath string) {
-	return path.Join(f._rootHash, f.relativePath(remote))
-}
-
 // Check if IPFS remote is a file (file type can only be obtained by
 // listing files of the parent directory)
 func (f *Fs) isFile(remote string) (error, bool) {
-	absolutePath := f.absolutePath(remote)
+	f.ipfsRoot.RLock()
+	rootHash := f.ipfsRoot.hash
+	f.ipfsRoot.RUnlock()
+	absolutePath := path.Join(rootHash, f.relativePath(remote))
 	dir, file := path.Split(absolutePath)
-	if dir == f._rootHash {
+	if dir == rootHash {
 		// root dir => not a file
 		return nil, false
 	} else {
@@ -204,22 +310,22 @@ func (f *Fs) isFile(remote string) (error, bool) {
 
 // Convert IPFS object cumulative size to actual file size
 // Only for small file of size < 262267
-func convertSmallFileSize(ipfsCumulativeSize int64) int64 {
+func convertSmallFileSize(cumulativeSize int64) int64 {
 	switch {
-	case ipfsCumulativeSize == 0:
+	case cumulativeSize == 0:
 		return 0
-	case ipfsCumulativeSize < 9:
-		return ipfsCumulativeSize - 6
-	case ipfsCumulativeSize < 131:
-		return ipfsCumulativeSize - 8
-	case ipfsCumulativeSize < 139:
-		return ipfsCumulativeSize - 9
-	case ipfsCumulativeSize < 16388:
-		return ipfsCumulativeSize - 11
-	case ipfsCumulativeSize < 16398:
-		return ipfsCumulativeSize - 12
+	case cumulativeSize < 9:
+		return cumulativeSize - 6
+	case cumulativeSize < 131:
+		return cumulativeSize - 8
+	case cumulativeSize < 139:
+		return cumulativeSize - 9
+	case cumulativeSize < 16388:
+		return cumulativeSize - 11
+	case cumulativeSize < 16398:
+		return cumulativeSize - 12
 	default:
-		return ipfsCumulativeSize - 14
+		return cumulativeSize - 14
 	}
 }
 
@@ -228,54 +334,17 @@ func (f *Fs) convertToFileSize(objectStat api.ObjectStat) int64 {
 	// Calculate file size
 	var fileSize int64
 	cumulativeSize := objectStat.CumulativeSize
-	if cumulativeSize < (IpfsMaxChunkSize + 123) {
+	if cumulativeSize < (MaxChunkSize + 123) {
 		// Single chunk file
 		fileSize = convertSmallFileSize(cumulativeSize)
 	} else {
 		// Multiple chunk file
 		i := cumulativeSize - objectStat.BlockSize
-		maxSizeChunks := i / (IpfsMaxChunkSize + 14)
-		remainingSizeChunk := i % (IpfsMaxChunkSize + 14)
+		maxSizeChunks := i / (MaxChunkSize + 14)
+		remainingSizeChunk := i % (MaxChunkSize + 14)
 		fileSize = i - (maxSizeChunks * 14) - (remainingSizeChunk - convertSmallFileSize(remainingSizeChunk))
 	}
 	return fileSize
-}
-
-// Persist modified IPFS DAG to IPFS MFS
-func (f *Fs) persistToMFS() {
-	fmt.Println("final root hash", f._rootHash)
-
-	// Make sure the IPFS MFS was not modified concurrently in the background
-	stat, err := f.api.FilesStat("/")
-	if err != nil {
-		panic(err)
-	}
-	if stat.Hash != f.initialRootHash {
-		panic("Error: concurrent modification of the IPFS MFS. Consistency not guaranteed.")
-	}
-
-	// List differences before and after rclone operations
-	diff, err := f.api.ObjectDiff(f.initialRootHash, f._rootHash)
-	if err != nil {
-		panic(err)
-	}
-
-	// Persist changes to IPFS MFS
-	for _, change := range diff.Changes {
-		if change.Before != nil {
-			err := f.api.FilesRm("/" + change.Path)
-			if err != nil {
-				panic(err)
-			}
-		}
-		if change.After != nil {
-			absolutePath := "/ipfs/" + change.After["/"]
-			err := f.api.FilesCp(absolutePath, "/"+change.Path)
-			if err != nil {
-				panic(err)
-			}
-		}
-	}
 }
 
 // Name of the remote (as passed into NewFs)
@@ -283,7 +352,7 @@ func (f *Fs) Name() string {
 	return f.name
 }
 
-// Root of the remote (as passed into NewFs)
+// SharedRoots of the remote (as passed into NewFs)
 func (f *Fs) Root() string {
 	return f.root
 }
@@ -318,7 +387,10 @@ func (f *Fs) Precision() time.Duration {
 // This should return ErrorDirNotFound if the directory isn't
 // found.
 func (f *Fs) List(dir string) (entries fs.DirEntries, err error) {
-	absolutePath := f.absolutePath(dir)
+	f.ipfsRoot.RLock()
+	rootHash := f.ipfsRoot.hash
+	f.ipfsRoot.RUnlock()
+	absolutePath := path.Join(rootHash, f.relativePath(dir))
 	links, err := f.api.Ls(absolutePath)
 	if err != nil {
 		if _, ok := err.(*api.Error); ok {
@@ -333,7 +405,8 @@ func (f *Fs) List(dir string) (entries fs.DirEntries, err error) {
 			d := fs.NewDir(remote, DefaultTime)
 			entries = append(entries, d)
 		} else {
-			stat, err := f.api.ObjectStat(f.absolutePath(remote))
+
+			stat, err := f.api.ObjectStat(path.Join(rootHash, f.relativePath(remote)))
 			if err != nil {
 				return nil, err
 			}
@@ -351,7 +424,9 @@ func (f *Fs) List(dir string) (entries fs.DirEntries, err error) {
 // NewObject finds the Object at remote.  If it can't be found
 // it returns the error fs.ErrorObjectNotFound. If is a directory
 func (f *Fs) NewObject(remote string) (fs.Object, error) {
-	absolutePath := f.absolutePath(remote)
+	f.ipfsRoot.RLock()
+	absolutePath := path.Join(f.ipfsRoot.hash, f.relativePath(remote))
+	f.ipfsRoot.RUnlock()
 	stat, err := f.api.ObjectStat(absolutePath)
 	if err != nil {
 		if _, ok := err.(*api.Error); ok {
@@ -383,16 +458,16 @@ func (f *Fs) Put(in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) (fs.
 		return nil, err
 	}
 	objectPath := f.relativePath(src.Remote())
-	result, err := f.api.ObjectPatchAddLink(f._rootHash, objectPath, fileAdded.Hash)
+
+	f.ipfsRoot.Lock()
+	result, err := f.api.ObjectPatchAddLink(f.ipfsRoot.hash, objectPath, fileAdded.Hash)
 	if err != nil {
+		f.ipfsRoot.Unlock()
 		return nil, err
 	}
-	f.SetRootHash(result.Hash)
-	o, err := f.NewObject(src.Remote())
-	if err != nil {
-		return nil, err
-	}
-	return o, nil
+	f.ipfsRoot.hash = result.Hash
+	f.ipfsRoot.Unlock()
+	return f.NewObject(src.Remote())
 }
 
 // Mkdir creates the container if it doesn't exist
@@ -402,12 +477,15 @@ func (f *Fs) Mkdir(dir string) error {
 		return err
 	}
 
+	f.ipfsRoot.Lock()
 	dirPath := f.relativePath(dir)
-	result, err := f.api.ObjectPatchAddLink(f._rootHash, dirPath, emptyDirHash)
+	result, err := f.api.ObjectPatchAddLink(f.ipfsRoot.hash, dirPath, emptyDirHash)
 	if err != nil {
+		f.ipfsRoot.Unlock()
 		return err
 	}
-	f.SetRootHash(result.Hash)
+	f.ipfsRoot.hash = result.Hash
+	f.ipfsRoot.Unlock()
 	return nil
 }
 
@@ -415,9 +493,11 @@ func (f *Fs) Mkdir(dir string) error {
 //
 // Returns ErrorDirectoryNotEmpty if it isn't empty
 func (f *Fs) Rmdir(dir string) error {
-	absolutePath := f.absolutePath(dir)
+	f.ipfsRoot.Lock()
+	absolutePath := path.Join(f.ipfsRoot.hash, f.relativePath(dir))
 	stat, err := f.api.ObjectStat(absolutePath)
 	if err != nil {
+		f.ipfsRoot.Unlock()
 		if _, ok := err.(*api.Error); ok {
 			return fs.ErrorDirNotFound
 		}
@@ -425,36 +505,30 @@ func (f *Fs) Rmdir(dir string) error {
 	}
 	// Should not have children
 	if stat.NumLinks > 0 {
+		f.ipfsRoot.Unlock()
 		return fs.ErrorDirectoryNotEmpty
 	}
 
 	dirPath := f.relativePath(dir)
-	result, err := f.api.ObjectPatchRmLink(f._rootHash, dirPath)
+	result, err := f.api.ObjectPatchRmLink(f.ipfsRoot.hash, dirPath)
 	if err != nil {
+		f.ipfsRoot.Unlock()
 		return err
 	}
-	f.SetRootHash(result.Hash)
+	f.ipfsRoot.hash = result.Hash
+	f.ipfsRoot.Unlock()
 	return nil
-}
-
-func (f *Fs) SetRootHash(rootHash string) {
-	rootHashCache["/"] = rootHash
-	f._rootHash = rootHash
 }
 
 // ------------------------------------------------------------
 
-// Fs returns the parent Fs
+// Fs returns the parent Fs²²
 func (o *Object) Fs() fs.Info {
 	return o.fs
 }
 
 func (o *Object) relativePath() string {
 	return o.fs.relativePath(o.Remote())
-}
-
-func (o *Object) absolutePath() string {
-	return o.fs.absolutePath(o.Remote())
 }
 
 // Return a string version
@@ -499,7 +573,10 @@ func (o *Object) Storable() bool {
 
 // Open an object for read
 func (o *Object) Open(options ...fs.OpenOption) (in io.ReadCloser, err error) {
-	return o.fs.api.Cat(o.absolutePath(), o.Size(), options...)
+	o.fs.ipfsRoot.RLock()
+	absolutePath := path.Join(o.fs.ipfsRoot.hash, o.relativePath())
+	o.fs.ipfsRoot.RUnlock()
+	return o.fs.api.Cat(absolutePath, o.Size(), options...)
 }
 
 // Update the object with the contents of the io.Reader, modTime and size
@@ -515,14 +592,17 @@ func (o *Object) Update(in io.Reader, src fs.ObjectInfo, options ...fs.OpenOptio
 
 // Remove an object
 func (o *Object) Remove() error {
-	result, err := o.fs.api.ObjectPatchRmLink(o.fs._rootHash, o.relativePath())
+	o.fs.ipfsRoot.Lock()
+	result, err := o.fs.api.ObjectPatchRmLink(o.fs.ipfsRoot.hash, o.relativePath())
 	if err != nil {
+		o.fs.ipfsRoot.Unlock()
 		if _, ok := err.(*api.Error); ok {
 			return fs.ErrorObjectNotFound
 		}
 		return err
 	}
-	o.fs.SetRootHash(result.Hash)
+	o.fs.ipfsRoot.hash = result.Hash
+	o.fs.ipfsRoot.Unlock()
 	return nil
 }
 
