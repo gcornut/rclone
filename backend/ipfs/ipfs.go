@@ -49,6 +49,8 @@ func init() {
 // chunk the original file
 const MaxChunkSize = int64(262144)
 
+const HttpGateway = "https://ipfs.io/ipfs/"
+
 type SharedRoots struct {
 	sync.RWMutex
 
@@ -193,9 +195,10 @@ type Fs struct {
 
 // Object is a remote object that has been stat'd (so it exists, but is not necessarily open for reading)
 type Object struct {
-	fs     *Fs
-	remote string
-	size   int64
+	fs       *Fs
+	remote   string
+	size     int64
+	ipfsHash string
 }
 
 // ------------------------------------------------------------
@@ -405,20 +408,24 @@ func (f *Fs) List(dir string) (entries fs.DirEntries, err error) {
 			d := fs.NewDir(remote, DefaultTime)
 			entries = append(entries, d)
 		} else {
-
 			stat, err := f.api.ObjectStat(path.Join(rootHash, f.relativePath(remote)))
 			if err != nil {
 				return nil, err
 			}
-			o := &Object{
-				fs:     f,
-				remote: remote,
-				size:   f.convertToFileSize(*stat),
-			}
+			o := newObject(f, remote, stat)
 			entries = append(entries, o)
 		}
 	}
 	return entries, nil
+}
+
+func newObject(f *Fs, remote string, stat *api.ObjectStat) *Object {
+	return &Object{
+		fs:       f,
+		remote:   remote,
+		size:     f.convertToFileSize(*stat),
+		ipfsHash: stat.Hash,
+	}
 }
 
 // NewObject finds the Object at remote.  If it can't be found
@@ -438,11 +445,7 @@ func (f *Fs) NewObject(remote string) (fs.Object, error) {
 	if !isFile {
 		return nil, fs.ErrorNotAFile
 	}
-	o := &Object{
-		fs:     f,
-		remote: remote,
-		size:   f.convertToFileSize(*stat),
-	}
+	o := newObject(f, remote, stat)
 	return o, nil
 }
 
@@ -518,6 +521,135 @@ func (f *Fs) Rmdir(dir string) error {
 	f.ipfsRoot.hash = result.Hash
 	f.ipfsRoot.Unlock()
 	return nil
+}
+
+func (f *Fs) Copy(src fs.Object, remote string) (fs.Object, error) {
+	objectPath := f.relativePath(remote)
+	var ipfsObject = src.(*Object)
+	f.ipfsRoot.Lock()
+	result, err := f.api.ObjectPatchAddLink(f.ipfsRoot.hash, objectPath, ipfsObject.ipfsHash)
+	if err != nil {
+		sharedRoot.Unlock()
+		return nil, err
+	}
+	f.ipfsRoot.hash = result.Hash
+	f.ipfsRoot.Unlock()
+	return f.NewObject(remote)
+}
+
+func (f *Fs) Move(src fs.Object, remote string) (o fs.Object, err error) {
+	if o, err = f.Copy(src, remote); err != nil {
+		return nil, err
+	}
+	if err = src.Remove(); err != nil {
+		return nil, err
+	}
+	return o, nil
+}
+
+func (f *Fs) DirMove(src fs.Fs, srcRemote string, dstRemote string) error {
+	srcFs := src.(*Fs)
+	f.ipfsRoot.Lock()
+	defer f.ipfsRoot.Unlock()
+
+	// Check dest dir does not exist
+	dstRelativePath := f.relativePath(dstRemote)
+	destAbsolutePath := path.Join(f.ipfsRoot.hash, dstRelativePath)
+	destStat, err := f.api.ObjectStat(destAbsolutePath)
+	if destStat != nil {
+		return fs.ErrorDirExists
+	}
+
+	// Fetch source dir stats (for the hash)
+	srcRelativePath := srcFs.relativePath(srcRemote)
+	println("DIR MOVE", srcRelativePath, dstRelativePath)
+	srcAbsolutePath := path.Join(f.ipfsRoot.hash, srcRelativePath)
+	srcStat, err := f.api.ObjectStat(srcAbsolutePath)
+	if err != nil {
+		return err
+	}
+
+	// Copy dir by hash
+	result, err := f.api.ObjectPatchAddLink(f.ipfsRoot.hash, dstRelativePath, srcStat.Hash)
+	if err != nil {
+		return err
+	}
+	f.ipfsRoot.hash = result.Hash
+
+	// Remove original dir
+	result, err = srcFs.api.ObjectPatchRmLink(f.ipfsRoot.hash, srcRelativePath)
+	if err != nil {
+		return err
+	}
+	f.ipfsRoot.hash = result.Hash
+	return nil
+}
+
+func (f *Fs) MergeDirs(dirs []fs.Directory) error {
+	firstDirectory := dirs[0]
+	srcPath := f.relativePath(firstDirectory.Remote())
+
+	f.ipfsRoot.Lock()
+	defer f.ipfsRoot.Unlock()
+	workingRootHash := f.ipfsRoot.hash
+	for _, dir := range dirs[1:] {
+		absolutePath := path.Join(workingRootHash, f.root, dir.Remote())
+		links, err := f.api.Ls(absolutePath)
+		if err != nil {
+			return err
+		}
+
+		for _, link := range links {
+			relativePath := path.Join(srcPath, link.Name)
+			result, err := f.api.ObjectPatchAddLink(workingRootHash, relativePath, link.Hash)
+			if err != nil {
+				return err
+			}
+			workingRootHash = result.Hash
+		}
+
+		result, err := f.api.ObjectPatchRmLink(workingRootHash, f.relativePath(dir.Remote()))
+		if err != nil {
+			return err
+		}
+		workingRootHash = result.Hash
+	}
+	f.ipfsRoot.hash = workingRootHash
+	return nil
+}
+
+func (f *Fs) PutStream(in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) (fs.Object, error) {
+	return f.Put(in, src, options...)
+}
+
+func (f *Fs) Purge() error {
+	f.ipfsRoot.Lock()
+	defer f.ipfsRoot.Unlock()
+	if f.root == "" {
+		emptyDirHash, err := f.emptyDirHash()
+		if err != nil {
+			return err
+		}
+		f.ipfsRoot.hash = emptyDirHash
+	} else {
+		result, err := f.api.ObjectPatchRmLink(f.ipfsRoot.hash, f.root)
+		if err != nil {
+			return err
+		}
+		f.ipfsRoot.hash = result.Hash
+	}
+	return nil
+}
+
+func (f *Fs) PublicLink(remote string) (string, error) {
+	f.ipfsRoot.RLock()
+	absolutePath := path.Join(f.ipfsRoot.hash, f.relativePath(remote))
+	f.ipfsRoot.RUnlock()
+
+	if _, err := f.api.ObjectStat(absolutePath); err != nil {
+		return "", err
+	}
+	return HttpGateway + absolutePath, nil
 }
 
 // ------------------------------------------------------------
@@ -606,8 +738,24 @@ func (o *Object) Remove() error {
 	return nil
 }
 
+func (o *Object) ID() string {
+	return o.ipfsHash
+}
+
 // Check the interfaces are satisfied
 var (
-	_ fs.Fs     = &Fs{}
-	_ fs.Object = &Object{}
+	_ fs.Fs     = (*Fs)(nil)
+	_ fs.Object = (*Object)(nil)
+
+	// Optional Fs
+	_ fs.Copier       = (*Fs)(nil)
+	_ fs.Mover        = (*Fs)(nil)
+	_ fs.PublicLinker = (*Fs)(nil)
+	_ fs.Purger       = (*Fs)(nil)
+	_ fs.PutStreamer  = (*Fs)(nil)
+	_ fs.MergeDirser  = (*Fs)(nil)
+	_ fs.DirMover     = (*Fs)(nil)
+
+	// Optional Object
+	_ fs.IDer = (*Object)(nil)
 )
