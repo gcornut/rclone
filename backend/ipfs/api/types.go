@@ -69,3 +69,19 @@ type ObjectChange struct {
 type ObjectDiff struct {
 	Changes []ObjectChange
 }
+
+// /api/v0/name/resolve
+type HasPath struct {
+	Path string
+}
+
+// /api/v0/key/list
+type Key struct {
+	Name string
+	Id   string
+}
+
+// /api/v0/key/list
+type KeyList struct {
+	Keys []Key
+}

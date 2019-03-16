@@ -269,3 +269,52 @@ func (a *Api) RepoGc() error {
 	}
 	return nil
 }
+
+// Resolve an IPNS path to IPFS path
+// /api/v0/name/resolve
+func (a *Api) NameResolve(ipnsPath string) (result *HasPath, err error) {
+	opts := rest.Opts{
+		Method: "GET",
+		Path:   "/api/v0/name/resolve",
+		Parameters: url.Values{
+			"arg": []string{ipnsPath},
+		},
+	}
+	_, err = a.srv.CallJSON(&opts, nil, &result)
+	if err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
+// List IPNS keys
+// /api/v0/key/list
+func (a *Api) KeyList() (result *KeyList, err error) {
+	opts := rest.Opts{
+		Method: "GET",
+		Path:   "/api/v0/key/list",
+	}
+	_, err = a.srv.CallJSON(&opts, nil, &result)
+	if err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
+// Publish a IPNS
+// /api/v0/name/publish
+func (a *Api) NamePublish(ipfsPath string, key string) (err error) {
+	opts := rest.Opts{
+		Method: "GET",
+		Path:   "/api/v0/name/publish",
+		Parameters: url.Values{
+			"arg": []string{ipfsPath},
+			"key": []string{key},
+		},
+	}
+	_, err = a.srv.Call(&opts)
+	if err != nil {
+		return err
+	}
+	return nil
+}

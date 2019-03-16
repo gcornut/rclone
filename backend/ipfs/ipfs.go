@@ -8,7 +8,6 @@ import (
 	"github.com/ncw/rclone/fs/config/configstruct"
 	"github.com/ncw/rclone/fs/fshttp"
 	"github.com/ncw/rclone/fs/hash"
-	"github.com/ncw/rclone/lib/atexit"
 	"github.com/pkg/errors"
 	"io"
 	"path"
@@ -18,11 +17,6 @@ import (
 )
 
 // TODO: handle hash pinning (pin on file add, pin update on MFS update, unpin individual files)
-// TODO: implement optional Fs interfaces
-// TODO: add read only access to `/ipfs/<HASH>` paths (via `--ipfs-root=<>` option)
-// TODO: add read/write  access to `/ipns/<HASH>` paths (via `--ipfs-root=<>` option)
-// TODO: add periodic flush to mutable FS (MFS or IPNS) rather than only at the end
-// TODO: export api calls to `go-ipfs-api`?
 // TODO: add new hash type (compute local IPFS hashes)
 // TODO: write documentation for IPFS backend
 
@@ -34,139 +28,48 @@ func init() {
 		NewFs:       NewFs,
 		Options: []fs.Option{{
 			Name:     "url",
-			Help:     "URL of http IPFS API server",
+			Help:     "IPFS API server URL.",
 			Required: true,
+			Default:  LocalGateway,
 			Examples: []fs.OptionExample{{
-				Value: "http://localhost:5001",
+				Value: LocalGateway,
 				Help:  "Connect to your local IPFS API server",
+			}, {
+				Value: PublicGateway,
+				Help:  "Connect to the public IPFS gateway (read only!)",
 			}},
+		}, {
+			Name: "root",
+			Help: "IPFS root ref path.\n" +
+				"Leave it empty to use IPFS MFS.\n" +
+				"Otherwise, set it to IPFS path (format \"/ipfs/<HASH>\") or IPNS path (format \"/ipns/<HASH>\"). ",
+			Default: "",
 		}},
 	}
 	fs.Register(fsi)
+}
+
+// Options defines the configuration for this backend
+type Options struct {
+	Endpoint string `config:"url"`
+	IpfsRoot string `config:"root"`
 }
 
 // Max size of a IPFS object data after which the IPFS chunker will
 // chunk the original file
 const MaxChunkSize = int64(262144)
 
-const HttpGateway = "https://ipfs.io/ipfs/"
+const LocalGateway = "http://localhost:5001"
+const PublicGateway = "https://ipfs.io"
 
 type SharedRoots struct {
 	sync.RWMutex
 
-	// Map from ENDPOINT:IPFS_PATH to IPFS Root
-	// example of map key "http://localhost:5001:/"
-	// => IPFS MFS on local IPFS node
+	// IPFS roots indexed by key ('<ENDPOINT>:<IPFS_ROOT>')
+	// examples of keys:
+	// => "http://localhost:5001:" IPFS MFS on local IPFS node
+	// => "http://localhost:5001:/ipns/<HASH>" IPNS on local IPFS node
 	cache map[string]*Root
-}
-
-type Root struct {
-	sync.RWMutex
-	api         *api.Api
-	initialHash string
-	hash        string
-	log         func(text string, args ...interface{})
-}
-
-func NewRoot(f *Fs, ipfsPath string) (*Root, error) {
-	stat, err := f.api.FilesStat(ipfsPath)
-	if err != nil {
-		return nil, err
-	}
-
-	r := Root{
-		api:         f.api,
-		initialHash: stat.Hash,
-		hash:        stat.Hash,
-		log: func(text string, args ...interface{}) {
-			fs.Logf(f, text, args...)
-		},
-	}
-
-	// Persist Fs changes to IPFS MFS on program exit
-	atexit.Register(r.persistToMFS)
-
-	// Also persist periodically
-	r.periodicPersist()
-	return &r, nil
-}
-
-// Persist modified IPFS DAG to IPFS MFS
-func (r *Root) persistToMFS() {
-	r.Lock()
-	defer r.Unlock()
-	if r.hash == r.initialHash {
-		return
-	}
-
-	// Make sure the IPFS MFS was not modified concurrently in the background
-	stat, err := r.api.FilesStat("/")
-	if err != nil {
-		panic(err)
-	}
-
-	// List differences before and after rclone operations
-	diff, err := r.api.ObjectDiff(r.initialHash, r.hash)
-	if err != nil {
-		panic(err)
-	}
-
-	if stat.Hash != r.initialHash {
-		externalDiff, err := r.api.ObjectDiff(stat.Hash, r.initialHash)
-		if err != nil {
-			panic(err)
-		}
-
-		listChangedPath := func(changes []api.ObjectChange) (paths []string) {
-			for _, change := range changes {
-				paths = append(paths, change.Path)
-			}
-			return paths
-		}
-		externalChangedPaths := listChangedPath(externalDiff.Changes)
-		localChangedPaths := listChangedPath(diff.Changes)
-
-		for _, externalChangedPath := range externalChangedPaths {
-			for _, localChangedPath := range localChangedPaths {
-				if strings.HasPrefix(externalChangedPath, localChangedPath) ||
-					strings.HasPrefix(localChangedPath, externalChangedPath) {
-					panic("Error: concurrent modification of the IPFS MFS. Consistency not guaranteed.")
-				}
-			}
-		}
-	}
-
-	// Persist changes to IPFS MFS
-	for _, change := range diff.Changes {
-		if change.Before != nil {
-			err := r.api.FilesRm("/" + change.Path)
-			if err != nil {
-				panic(err)
-			}
-		}
-		if change.After != nil {
-			absolutePath := "/ipfs/" + change.After["/"]
-			err := r.api.FilesCp(absolutePath, "/"+change.Path)
-			if err != nil {
-				panic(err)
-			}
-		}
-	}
-	r.log("Persisted root hash %s in IPFS MFS", r.hash)
-
-	stat, err = r.api.FilesStat("/")
-	if err != nil {
-		panic(err)
-	}
-	r.initialHash = stat.Hash
-	r.hash = stat.Hash
-}
-
-func (r *Root) periodicPersist() {
-	nextTime := time.Now().Add(PersistPeriod)
-	time.Sleep(time.Until(nextTime))
-	r.persistToMFS()
-	go r.periodicPersist()
 }
 
 var (
@@ -176,11 +79,6 @@ var (
 )
 
 // ------------------------------------------------------------
-
-// Options defines the configuration for this backend
-type Options struct {
-	Endpoint string `config:"url"`
-}
 
 // Fs stores the interface to the remote HTTP files
 type Fs struct {
@@ -212,6 +110,7 @@ func NewFs(name string, root string, m configmap.Mapper) (fs.Fs, error) {
 		return nil, err
 	}
 
+	opt.Endpoint = removeTrailingSlash(opt.Endpoint)
 	client := fshttp.NewClient(fs.Config)
 
 	f := &Fs{
@@ -224,13 +123,11 @@ func NewFs(name string, root string, m configmap.Mapper) (fs.Fs, error) {
 		CanHaveEmptyDirectories: true,
 	}).Fill(f)
 
-	ipfsPath := "/" // for IPFS MFS (will change for IPNS)
-
 	sharedRoot.Lock()
-	ipfsRootKey := opt.Endpoint + ":" + ipfsPath
+	ipfsRootKey := opt.Endpoint + ":" + opt.IpfsRoot
 	ipfsRoot := sharedRoot.cache[ipfsRootKey]
 	if ipfsRoot == nil {
-		ipfsRoot, err = NewRoot(f, ipfsPath)
+		ipfsRoot, err = NewRoot(f)
 		if err != nil {
 			return nil, err
 		}
@@ -277,13 +174,17 @@ func (f *Fs) emptyDirHash() (string, error) {
 	return f._emptyDirHash, nil
 }
 
-func (f *Fs) relativePath(remote string) (relativePath string) {
-	relativePath = path.Join(f.root, remote)
-	if strings.HasPrefix(relativePath, "/") {
+func removeTrailingSlash(s string) string {
+	if strings.HasPrefix(s, "/") {
 		// Should not start with "/"
-		relativePath = relativePath[1:]
+		return s[1:]
 	}
-	return relativePath
+	return s
+}
+
+func (f *Fs) relativePath(remote string) (relativePath string) {
+	// Should not start with "/"
+	return removeTrailingSlash(path.Join(f.root, remote))
 }
 
 // Check if IPFS remote is a file (file type can only be obtained by
@@ -348,6 +249,13 @@ func (f *Fs) convertToFileSize(objectStat api.ObjectStat) int64 {
 		fileSize = i - (maxSizeChunks * 14) - (remainingSizeChunk - convertSmallFileSize(remainingSizeChunk))
 	}
 	return fileSize
+}
+
+func (f *Fs) checkReadOnly() error {
+	if f.ipfsRoot.isReadOnly {
+		return errors.New("IPFS path '" + f.opt.IpfsRoot + "' is read only!")
+	}
+	return nil
 }
 
 // Name of the remote (as passed into NewFs)
@@ -455,6 +363,10 @@ func (f *Fs) NewObject(remote string) (fs.Object, error) {
 //
 // The new object may have been created if an error is returned
 func (f *Fs) Put(in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) (fs.Object, error) {
+	err := f.checkReadOnly()
+	if err != nil {
+		return nil, err
+	}
 	_, file := path.Split(src.Remote())
 	fileAdded, err := f.api.Add(in, file, options...)
 	if err != nil {
@@ -475,6 +387,10 @@ func (f *Fs) Put(in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) (fs.
 
 // Mkdir creates the container if it doesn't exist
 func (f *Fs) Mkdir(dir string) error {
+	err := f.checkReadOnly()
+	if err != nil {
+		return err
+	}
 	emptyDirHash, err := f.emptyDirHash()
 	if err != nil {
 		return err
@@ -496,6 +412,10 @@ func (f *Fs) Mkdir(dir string) error {
 //
 // Returns ErrorDirectoryNotEmpty if it isn't empty
 func (f *Fs) Rmdir(dir string) error {
+	err := f.checkReadOnly()
+	if err != nil {
+		return err
+	}
 	f.ipfsRoot.Lock()
 	absolutePath := path.Join(f.ipfsRoot.hash, f.relativePath(dir))
 	stat, err := f.api.ObjectStat(absolutePath)
@@ -524,12 +444,16 @@ func (f *Fs) Rmdir(dir string) error {
 }
 
 func (f *Fs) Copy(src fs.Object, remote string) (fs.Object, error) {
+	err := f.checkReadOnly()
+	if err != nil {
+		return nil, err
+	}
 	objectPath := f.relativePath(remote)
 	var ipfsObject = src.(*Object)
 	f.ipfsRoot.Lock()
 	result, err := f.api.ObjectPatchAddLink(f.ipfsRoot.hash, objectPath, ipfsObject.ipfsHash)
 	if err != nil {
-		sharedRoot.Unlock()
+		f.ipfsRoot.Unlock()
 		return nil, err
 	}
 	f.ipfsRoot.hash = result.Hash
@@ -538,6 +462,10 @@ func (f *Fs) Copy(src fs.Object, remote string) (fs.Object, error) {
 }
 
 func (f *Fs) Move(src fs.Object, remote string) (o fs.Object, err error) {
+	err = f.checkReadOnly()
+	if err != nil {
+		return nil, err
+	}
 	if o, err = f.Copy(src, remote); err != nil {
 		return nil, err
 	}
@@ -548,6 +476,10 @@ func (f *Fs) Move(src fs.Object, remote string) (o fs.Object, err error) {
 }
 
 func (f *Fs) DirMove(src fs.Fs, srcRemote string, dstRemote string) error {
+	err := f.checkReadOnly()
+	if err != nil {
+		return err
+	}
 	srcFs := src.(*Fs)
 	f.ipfsRoot.Lock()
 	defer f.ipfsRoot.Unlock()
@@ -562,7 +494,6 @@ func (f *Fs) DirMove(src fs.Fs, srcRemote string, dstRemote string) error {
 
 	// Fetch source dir stats (for the hash)
 	srcRelativePath := srcFs.relativePath(srcRemote)
-	println("DIR MOVE", srcRelativePath, dstRelativePath)
 	srcAbsolutePath := path.Join(f.ipfsRoot.hash, srcRelativePath)
 	srcStat, err := f.api.ObjectStat(srcAbsolutePath)
 	if err != nil {
@@ -586,6 +517,10 @@ func (f *Fs) DirMove(src fs.Fs, srcRemote string, dstRemote string) error {
 }
 
 func (f *Fs) MergeDirs(dirs []fs.Directory) error {
+	err := f.checkReadOnly()
+	if err != nil {
+		return err
+	}
 	firstDirectory := dirs[0]
 	srcPath := f.relativePath(firstDirectory.Remote())
 
@@ -623,6 +558,10 @@ func (f *Fs) PutStream(in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption
 }
 
 func (f *Fs) Purge() error {
+	err := f.checkReadOnly()
+	if err != nil {
+		return err
+	}
 	f.ipfsRoot.Lock()
 	defer f.ipfsRoot.Unlock()
 	if f.root == "" {
@@ -643,18 +582,30 @@ func (f *Fs) Purge() error {
 
 func (f *Fs) PublicLink(remote string) (string, error) {
 	f.ipfsRoot.RLock()
-	absolutePath := path.Join(f.ipfsRoot.hash, f.relativePath(remote))
+	ipfsHash := f.ipfsRoot.hash
+	ipnsPath := f.ipfsRoot.ipnsPath
 	f.ipfsRoot.RUnlock()
 
-	if _, err := f.api.ObjectStat(absolutePath); err != nil {
+	var urlPath string
+	if ipnsPath == "" {
+		// IPFS path
+		urlPath = path.Join("/ipfs", ipfsHash, f.relativePath(remote))
+	} else {
+		// IPNS path
+		urlPath = path.Join(ipnsPath, f.relativePath(remote))
+	}
+
+	// Check path exists
+	_, err := f.api.ObjectStat(path.Join(ipfsHash, f.relativePath(remote)))
+	if err != nil {
 		return "", err
 	}
-	return HttpGateway + absolutePath, nil
+	return PublicGateway + urlPath, nil
 }
 
 // ------------------------------------------------------------
 
-// Fs returns the parent Fs²²
+// Fs returns the parent Fs
 func (o *Object) Fs() fs.Info {
 	return o.fs
 }
@@ -724,6 +675,10 @@ func (o *Object) Update(in io.Reader, src fs.ObjectInfo, options ...fs.OpenOptio
 
 // Remove an object
 func (o *Object) Remove() error {
+	err := o.fs.checkReadOnly()
+	if err != nil {
+		return err
+	}
 	o.fs.ipfsRoot.Lock()
 	result, err := o.fs.api.ObjectPatchRmLink(o.fs.ipfsRoot.hash, o.relativePath())
 	if err != nil {
