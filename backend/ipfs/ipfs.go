@@ -187,31 +187,6 @@ func (f *Fs) relativePath(remote string) (relativePath string) {
 	return removeTrailingSlash(path.Join(f.root, remote))
 }
 
-// Check if IPFS remote is a file (file type can only be obtained by
-// listing files of the parent directory)
-func (f *Fs) isFile(remote string) (error, bool) {
-	f.ipfsRoot.RLock()
-	rootHash := f.ipfsRoot.hash
-	f.ipfsRoot.RUnlock()
-	absolutePath := path.Join(rootHash, f.relativePath(remote))
-	dir, file := path.Split(absolutePath)
-	if dir == rootHash {
-		// root dir => not a file
-		return nil, false
-	} else {
-		links, err := f.api.Ls(dir)
-		if err != nil {
-			return err, false
-		}
-		for _, link := range links {
-			if link.Name == file {
-				return nil, link.Type == api.FileEntryTypeFile
-			}
-		}
-		return nil, false
-	}
-}
-
 // Convert IPFS object cumulative size to actual file size
 // Only for small file of size < 262267
 func convertSmallFileSize(cumulativeSize int64) int64 {
@@ -340,8 +315,9 @@ func newObject(f *Fs, remote string, stat *api.ObjectStat) *Object {
 // it returns the error fs.ErrorObjectNotFound. If is a directory
 func (f *Fs) NewObject(remote string) (fs.Object, error) {
 	f.ipfsRoot.RLock()
-	absolutePath := path.Join(f.ipfsRoot.hash, f.relativePath(remote))
+	rootHash := f.ipfsRoot.hash
 	f.ipfsRoot.RUnlock()
+	absolutePath := path.Join(rootHash, f.relativePath(remote))
 	stat, err := f.api.ObjectStat(absolutePath)
 	if err != nil {
 		if _, ok := err.(*api.Error); ok {
@@ -349,7 +325,21 @@ func (f *Fs) NewObject(remote string) (fs.Object, error) {
 		}
 		return nil, err
 	}
-	_, isFile := f.isFile(remote)
+
+	var isFile bool
+	dir, file := path.Split(absolutePath)
+	if dir != rootHash {
+		links, err := f.api.Ls(dir)
+		if err != nil {
+			return nil, err
+		}
+		for _, link := range links {
+			if link.Name == file {
+				isFile = link.Type == api.FileEntryTypeFile
+				break
+			}
+		}
+	}
 	if !isFile {
 		return nil, fs.ErrorNotAFile
 	}
@@ -397,14 +387,20 @@ func (f *Fs) Mkdir(dir string) error {
 	}
 
 	f.ipfsRoot.Lock()
+	defer f.ipfsRoot.Unlock()
 	dirPath := f.relativePath(dir)
+
+	_, err = f.api.ObjectStat(path.Join(f.ipfsRoot.hash, dirPath))
+	if err == nil {
+		// path already exists
+		return nil
+	}
+
 	result, err := f.api.ObjectPatchAddLink(f.ipfsRoot.hash, dirPath, emptyDirHash)
 	if err != nil {
-		f.ipfsRoot.Unlock()
 		return err
 	}
 	f.ipfsRoot.hash = result.Hash
-	f.ipfsRoot.Unlock()
 	return nil
 }
 
@@ -417,10 +413,10 @@ func (f *Fs) Rmdir(dir string) error {
 		return err
 	}
 	f.ipfsRoot.Lock()
+	defer f.ipfsRoot.Unlock()
 	absolutePath := path.Join(f.ipfsRoot.hash, f.relativePath(dir))
 	stat, err := f.api.ObjectStat(absolutePath)
 	if err != nil {
-		f.ipfsRoot.Unlock()
 		if _, ok := err.(*api.Error); ok {
 			return fs.ErrorDirNotFound
 		}
@@ -428,18 +424,15 @@ func (f *Fs) Rmdir(dir string) error {
 	}
 	// Should not have children
 	if stat.NumLinks > 0 {
-		f.ipfsRoot.Unlock()
 		return fs.ErrorDirectoryNotEmpty
 	}
 
 	dirPath := f.relativePath(dir)
 	result, err := f.api.ObjectPatchRmLink(f.ipfsRoot.hash, dirPath)
 	if err != nil {
-		f.ipfsRoot.Unlock()
 		return err
 	}
 	f.ipfsRoot.hash = result.Hash
-	f.ipfsRoot.Unlock()
 	return nil
 }
 
@@ -669,8 +662,11 @@ func (o *Object) Open(options ...fs.OpenOption) (in io.ReadCloser, err error) {
 // The new object may have been created if an error is returned
 func (o *Object) Update(in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) error {
 	o2, err := o.fs.Put(in, src, options...)
+	if err != nil {
+		return err
+	}
 	o.size = o2.Size()
-	return err
+	return nil
 }
 
 // Remove an object
