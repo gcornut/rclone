@@ -661,10 +661,11 @@ func (o *Object) Open(options ...fs.OpenOption) (in io.ReadCloser, err error) {
 //
 // The new object may have been created if an error is returned
 func (o *Object) Update(in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) error {
-	o2, err := o.fs.Put(in, src, options...)
+	o2, err := o.fs.Put(in, o, options...)
 	if err != nil {
 		return err
 	}
+	o.ipfsHash = o2.(*Object).ipfsHash
 	o.size = o2.Size()
 	return nil
 }
