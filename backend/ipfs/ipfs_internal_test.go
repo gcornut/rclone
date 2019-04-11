@@ -14,7 +14,7 @@ import (
 func putRandomFile(t *testing.T, f fs.Fs, nBytes int64) fs.Object {
 	fileSuffix := fstest.RandomString(100)
 	file := fstest.Item{
-		ModTime: DefaultTime,
+		ModTime: DefaultModTime,
 		Path:    "file-" + fileSuffix + ".txt",
 	}
 

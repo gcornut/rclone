@@ -9,12 +9,12 @@ import (
 	"strconv"
 )
 
-type Api struct {
+type Client struct {
 	srv *rest.Client // the connection to the server
 }
 
-func NewApi(client *http.Client, endpoint string) *Api {
-	api := Api{
+func NewApi(client *http.Client, endpoint string) *Client {
+	api := Client{
 		srv: rest.NewClient(client).SetRoot(endpoint),
 	}
 	api.srv.SetErrorHandler(errorHandler)
@@ -34,7 +34,7 @@ func errorHandler(resp *http.Response) error {
 
 // Add file to IPFS
 // /api/v0/add
-func (a *Api) Add(in io.Reader, name string, options ...fs.OpenOption) (result *FileAdded, err error) {
+func (a *Client) Add(in io.Reader, name string, options ...fs.OpenOption) (result *FileAdded, err error) {
 	opts := rest.Opts{
 		Method:               "POST",
 		Path:                 "/api/v0/add",
@@ -54,9 +54,29 @@ func (a *Api) Add(in io.Reader, name string, options ...fs.OpenOption) (result *
 	return result, nil
 }
 
+// Check that the endpoint is read only
+func (a *Client) IsReadOnly() (isReadOnly bool, err error) {
+	opts := rest.Opts{
+		Method: "POST",
+		Path:   "/api/v0/add",
+	}
+	resp, err := a.srv.Call(&opts)
+	if resp != nil && resp.StatusCode == 404 {
+		// 404 => endpoint is read only
+		return true, nil
+	}
+
+	if resp != nil && resp.StatusCode == 400 {
+		// 400 => endpoint is read/write
+		return false, nil
+	}
+
+	return false, err
+}
+
 // List file in IPFS path
 // /api/v0/ls
-func (a *Api) Ls(path string) ([]Link, error) {
+func (a *Client) Ls(path string) ([]Link, error) {
 	opts := rest.Opts{
 		Method: "GET",
 		Path:   "/api/v0/ls",
@@ -75,7 +95,7 @@ func (a *Api) Ls(path string) ([]Link, error) {
 
 // Read file in IPFS path
 // /api/v0/cat
-func (a *Api) Cat(objectPath string, objectSize int64, options ...fs.OpenOption) (result io.ReadCloser, err error) {
+func (a *Client) Cat(objectPath string, objectSize int64, options ...fs.OpenOption) (result io.ReadCloser, err error) {
 	opts := rest.Opts{
 		Method: "GET",
 		Path:   "/api/v0/cat",
@@ -116,7 +136,7 @@ func (a *Api) Cat(objectPath string, objectSize int64, options ...fs.OpenOption)
 
 // Get IPFS DAG object stat
 // /api/v0/object/stat
-func (a *Api) ObjectStat(objectPath string) (result *ObjectStat, err error) {
+func (a *Client) ObjectStat(objectPath string) (result *ObjectStat, err error) {
 	opts := rest.Opts{
 		Method: "GET",
 		Path:   "/api/v0/object/stat",
@@ -133,7 +153,7 @@ func (a *Api) ObjectStat(objectPath string) (result *ObjectStat, err error) {
 
 // Patch a IPFS DAG object by adding (or replacing) a link.
 // /api/v0/object/patch/add-link
-func (a *Api) ObjectPatchAddLink(rootHash string, path string, linkHash string) (result *HasHash, err error) {
+func (a *Client) ObjectPatchAddLink(rootHash string, path string, linkHash string) (result *HasHash, err error) {
 	opts := rest.Opts{
 		Method: "GET",
 		Path:   "/api/v0/object/patch/add-link",
@@ -153,7 +173,7 @@ func (a *Api) ObjectPatchAddLink(rootHash string, path string, linkHash string) 
 
 // Patch a IPFS DAG object by removing a link.
 // /api/v0/object/patch/rm-link
-func (a *Api) ObjectPatchRmLink(rootHash string, path string) (result *HasHash, err error) {
+func (a *Client) ObjectPatchRmLink(rootHash string, path string) (result *HasHash, err error) {
 	opts := rest.Opts{
 		Method: "GET",
 		Path:   "/api/v0/object/patch/rm-link",
@@ -172,7 +192,7 @@ func (a *Api) ObjectPatchRmLink(rootHash string, path string) (result *HasHash, 
 
 // Create a new empty dir IPFS DAG object
 // /api/v0/object/new
-func (a *Api) ObjectNewDir() (result *HasHash, err error) {
+func (a *Client) ObjectNewDir() (result *HasHash, err error) {
 	opts := rest.Opts{
 		Method: "GET",
 		Path:   "/api/v0/object/new",
@@ -189,7 +209,7 @@ func (a *Api) ObjectNewDir() (result *HasHash, err error) {
 
 // Diff two IPFS DAG object
 // /api/v0/object/diff
-func (a *Api) ObjectDiff(object1 string, object2 string) (result *ObjectDiff, err error) {
+func (a *Client) ObjectDiff(object1 string, object2 string) (result *ObjectDiff, err error) {
 	opts := rest.Opts{
 		Method: "GET",
 		Path:   "/api/v0/object/diff",
@@ -206,7 +226,7 @@ func (a *Api) ObjectDiff(object1 string, object2 string) (result *ObjectDiff, er
 
 // Get file stat in IPFS MFS
 // /api/v0/files/stat
-func (a *Api) FilesStat(file string) (result *HasHash, err error) {
+func (a *Client) FilesStat(file string) (result *HasHash, err error) {
 	opts := rest.Opts{
 		Method: "GET",
 		Path:   "/api/v0/files/stat",
@@ -223,7 +243,7 @@ func (a *Api) FilesStat(file string) (result *HasHash, err error) {
 
 // Copy IPFS file to IPFS MFS
 // /api/v0/files/cp
-func (a *Api) FilesCp(from string, to string) error {
+func (a *Client) FilesCp(from string, to string) error {
 	opts := rest.Opts{
 		Method: "GET",
 		Path:   "/api/v0/files/cp",
@@ -240,7 +260,7 @@ func (a *Api) FilesCp(from string, to string) error {
 
 // Remove a IPFS MFS file
 // /api/v0/files/rm
-func (a *Api) FilesRm(dir string) error {
+func (a *Client) FilesRm(dir string) error {
 	opts := rest.Opts{
 		Method: "GET",
 		Path:   "/api/v0/files/rm",
@@ -258,7 +278,7 @@ func (a *Api) FilesRm(dir string) error {
 
 // IPFS repo garbage collecting
 // /api/v0/repo/gc
-func (a *Api) RepoGc() error {
+func (a *Client) RepoGc() error {
 	opts := rest.Opts{
 		Method: "GET",
 		Path:   "/api/v0/repo/gc",
@@ -272,7 +292,7 @@ func (a *Api) RepoGc() error {
 
 // Resolve an IPNS path to IPFS path
 // /api/v0/name/resolve
-func (a *Api) NameResolve(ipnsPath string) (result *HasPath, err error) {
+func (a *Client) NameResolve(ipnsPath string) (result *HasPath, err error) {
 	opts := rest.Opts{
 		Method: "GET",
 		Path:   "/api/v0/name/resolve",
@@ -289,7 +309,7 @@ func (a *Api) NameResolve(ipnsPath string) (result *HasPath, err error) {
 
 // List IPNS keys
 // /api/v0/key/list
-func (a *Api) KeyList() (result *KeyList, err error) {
+func (a *Client) KeyList() (result *KeyList, err error) {
 	opts := rest.Opts{
 		Method: "GET",
 		Path:   "/api/v0/key/list",
@@ -303,13 +323,48 @@ func (a *Api) KeyList() (result *KeyList, err error) {
 
 // Publish a IPNS
 // /api/v0/name/publish
-func (a *Api) NamePublish(ipfsPath string, key string) (err error) {
+func (a *Client) NamePublish(ipfsPath string, key string) (err error) {
 	opts := rest.Opts{
 		Method: "GET",
 		Path:   "/api/v0/name/publish",
 		Parameters: url.Values{
 			"arg": []string{ipfsPath},
 			"key": []string{key},
+		},
+	}
+	_, err = a.srv.Call(&opts)
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
+// Pin an IPFS hash
+// /api/v0/pin/add
+func (a *Client) PinAdd(hash string, recursive bool) (err error) {
+	opts := rest.Opts{
+		Method: "GET",
+		Path:   "/api/v0/pin/add",
+		Parameters: url.Values{
+			"arg":       []string{hash},
+			"recursive": []string{strconv.FormatBool(recursive)},
+		},
+	}
+	_, err = a.srv.Call(&opts)
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
+// Unpin an IPFS hash
+// /api/v0/pin/rm
+func (a *Client) PinRm(hash string) (err error) {
+	opts := rest.Opts{
+		Method: "GET",
+		Path:   "/api/v0/pin/rm",
+		Parameters: url.Values{
+			"arg": []string{hash},
 		},
 	}
 	_, err = a.srv.Call(&opts)

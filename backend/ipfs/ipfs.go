@@ -16,7 +16,7 @@ import (
 	"time"
 )
 
-// TODO: handle hash pinning (pin on file add, pin update on MFS update, unpin individual files)
+// TODO: Use "cat" to get file size rather than converting the cumulative file size
 // TODO: add new hash type (compute local IPFS hashes)
 // TODO: write documentation for IPFS backend
 
@@ -44,6 +44,11 @@ func init() {
 				"Leave it empty to use IPFS MFS.\n" +
 				"Otherwise, set it to IPFS path (format \"/ipfs/<HASH>\") or IPNS path (format \"/ipns/<HASH>\"). ",
 			Default: "",
+		}, {
+			Name:     "update_period",
+			Help:     "Time between periodic update to persist modifications (ignore in read only mode).",
+			Advanced: true,
+			Default:  DefaultUpdatePeriod,
 		}},
 	}
 	fs.Register(fsi)
@@ -51,8 +56,9 @@ func init() {
 
 // Options defines the configuration for this backend
 type Options struct {
-	Endpoint string `config:"url"`
-	IpfsRoot string `config:"root"`
+	Endpoint     string      `config:"url"`
+	IpfsRoot     string      `config:"root"`
+	UpdatePeriod fs.Duration `config:"update_period"`
 }
 
 // Max size of a IPFS object data after which the IPFS chunker will
@@ -65,17 +71,14 @@ const PublicGateway = "https://ipfs.io"
 type SharedRoots struct {
 	sync.RWMutex
 
-	// IPFS roots indexed by key ('<ENDPOINT>:<IPFS_ROOT>')
-	// examples of keys:
-	// => "http://localhost:5001:" IPFS MFS on local IPFS node
-	// => "http://localhost:5001:/ipns/<HASH>" IPNS on local IPFS node
-	cache map[string]*Root
+	// IPFS roots indexed by Fs Options
+	cache map[Options]*Root
 }
 
 var (
-	DefaultTime   = time.Unix(0, 0)
-	PersistPeriod = time.Second
-	sharedRoot    = &SharedRoots{cache: make(map[string]*Root)}
+	DefaultModTime      = time.Unix(0, 0)
+	DefaultUpdatePeriod = fs.Duration(15 * time.Second)
+	sharedRoot          = &SharedRoots{cache: make(map[Options]*Root)}
 )
 
 // ------------------------------------------------------------
@@ -86,7 +89,7 @@ type Fs struct {
 	root          string
 	features      *fs.Features // optional features
 	opt           Options      // options for this backend
-	api           *api.Api     // the connection to the server
+	api           *api.Client  // the connection to the server
 	ipfsRoot      *Root
 	_emptyDirHash string // IPFS hash of an empty dir
 }
@@ -124,14 +127,13 @@ func NewFs(name string, root string, m configmap.Mapper) (fs.Fs, error) {
 	}).Fill(f)
 
 	sharedRoot.Lock()
-	ipfsRootKey := opt.Endpoint + ":" + opt.IpfsRoot
-	ipfsRoot := sharedRoot.cache[ipfsRootKey]
+	ipfsRoot := sharedRoot.cache[*opt]
 	if ipfsRoot == nil {
 		ipfsRoot, err = NewRoot(f)
 		if err != nil {
 			return nil, err
 		}
-		sharedRoot.cache[ipfsRootKey] = ipfsRoot
+		sharedRoot.cache[*opt] = ipfsRoot
 	}
 	f.ipfsRoot = ipfsRoot
 	sharedRoot.Unlock()
@@ -209,16 +211,16 @@ func convertSmallFileSize(cumulativeSize int64) int64 {
 }
 
 // Convert IPFS object size to actual file size
-func (f *Fs) convertToFileSize(objectStat api.ObjectStat) int64 {
+func (f *Fs) convertToFileSize(stat api.ObjectStat) int64 {
 	// Calculate file size
 	var fileSize int64
-	cumulativeSize := objectStat.CumulativeSize
+	cumulativeSize := stat.CumulativeSize
 	if cumulativeSize < (MaxChunkSize + 123) {
 		// Single chunk file
 		fileSize = convertSmallFileSize(cumulativeSize)
 	} else {
 		// Multiple chunk file
-		i := cumulativeSize - objectStat.BlockSize
+		i := cumulativeSize - stat.BlockSize
 		maxSizeChunks := i / (MaxChunkSize + 14)
 		remainingSizeChunk := i % (MaxChunkSize + 14)
 		fileSize = i - (maxSizeChunks * 14) - (remainingSizeChunk - convertSmallFileSize(remainingSizeChunk))
@@ -288,7 +290,7 @@ func (f *Fs) List(dir string) (entries fs.DirEntries, err error) {
 	for _, link := range links {
 		remote := path.Join(dir, link.Name)
 		if link.Type == api.FileEntryTypeFolder {
-			d := fs.NewDir(remote, DefaultTime)
+			d := fs.NewDir(remote, DefaultModTime)
 			entries = append(entries, d)
 		} else {
 			stat, err := f.api.ObjectStat(path.Join(rootHash, f.relativePath(remote)))
@@ -558,14 +560,19 @@ func (f *Fs) Purge() error {
 	f.ipfsRoot.Lock()
 	defer f.ipfsRoot.Unlock()
 	if f.root == "" {
+		// If root folder => replace with empty dir Hash
 		emptyDirHash, err := f.emptyDirHash()
 		if err != nil {
 			return err
 		}
 		f.ipfsRoot.hash = emptyDirHash
 	} else {
+		// Else => remove dir
 		result, err := f.api.ObjectPatchRmLink(f.ipfsRoot.hash, f.root)
 		if err != nil {
+			if strings.Contains(err.Error(), "not found") {
+				return fs.ErrorDirNotFound
+			}
 			return err
 		}
 		f.ipfsRoot.hash = result.Hash
@@ -632,7 +639,7 @@ func (o *Object) Size() int64 {
 
 // ModTime returns the modification time of the object
 func (o *Object) ModTime() time.Time {
-	return DefaultTime
+	return DefaultModTime
 }
 
 // SetModTime sets the modification time of the local fs object
@@ -677,16 +684,15 @@ func (o *Object) Remove() error {
 		return err
 	}
 	o.fs.ipfsRoot.Lock()
+	defer o.fs.ipfsRoot.Unlock()
 	result, err := o.fs.api.ObjectPatchRmLink(o.fs.ipfsRoot.hash, o.relativePath())
 	if err != nil {
-		o.fs.ipfsRoot.Unlock()
 		if _, ok := err.(*api.Error); ok {
 			return fs.ErrorObjectNotFound
 		}
 		return err
 	}
 	o.fs.ipfsRoot.hash = result.Hash
-	o.fs.ipfsRoot.Unlock()
 	return nil
 }
 

@@ -1,10 +1,10 @@
 package ipfs
 
 import (
-	"errors"
 	"github.com/ncw/rclone/backend/ipfs/api"
 	"github.com/ncw/rclone/fs"
 	"github.com/ncw/rclone/lib/atexit"
+	"github.com/pkg/errors"
 	"path"
 	"strings"
 	"sync"
@@ -13,20 +13,27 @@ import (
 
 type Root struct {
 	sync.RWMutex
-	api         *api.Api
-	initialHash string
-	hash        string
-	ipnsPath    string
-	ipnsKey     string
-	isMFS       bool
-	isReadOnly  bool
+	api               *api.Client
+	opt               Options
+	lastPersistedHash string
+	hash              string
+	ipnsPath          string
+	ipnsKey           string
+	isMFS             bool
+	isReadOnly        bool
+
+	// Wait group for persisting background go routine
+	bgPersisting sync.WaitGroup
 }
 
 func NewRoot(f *Fs) (*Root, error) {
 	var ipnsKey string
 	var ipnsPath string
 	var isMFS bool
-	isGateWay := f.opt.Endpoint == PublicGateway
+	isEndpointReadOnly, err := f.api.IsReadOnly()
+	if err != nil {
+		return nil, err
+	}
 
 	base, hash := path.Split(f.opt.IpfsRoot)
 
@@ -38,7 +45,7 @@ func NewRoot(f *Fs) (*Root, error) {
 		ipnsPath = f.opt.IpfsRoot
 		ipnsHash := hash
 
-		if !isGateWay {
+		if !isEndpointReadOnly {
 			keys, err := f.api.KeyList()
 			if err != nil {
 				return nil, err
@@ -51,7 +58,7 @@ func NewRoot(f *Fs) (*Root, error) {
 			}
 			if ipnsKey == "" {
 				fs.Logf(f, "IPNS path '"+ipnsPath+"' is read only "+
-					"since the endpoint does not have the right key to modify it!")
+					"since the endpoint does not have the private key to modify it!")
 			}
 		} else {
 			fs.Logf(f, "IPNS path '"+ipnsPath+"' is read only "+
@@ -65,7 +72,7 @@ func NewRoot(f *Fs) (*Root, error) {
 		}
 		_, hash = path.Split(result.Path)
 	} else if f.opt.IpfsRoot == "" {
-		if isGateWay {
+		if isEndpointReadOnly {
 			return nil, errors.New(
 				"read only public IPFS gateway can't use MFS. " +
 					"Please use a IPFS path or IPNS path as `--ipfs-root` parameter")
@@ -82,49 +89,65 @@ func NewRoot(f *Fs) (*Root, error) {
 	}
 
 	r := Root{
-		api:         f.api,
-		initialHash: hash,
-		hash:        hash,
-		ipnsPath:    ipnsPath,
-		ipnsKey:     ipnsKey,
-		isMFS:       isMFS,
-		isReadOnly:  isGateWay || !(isMFS || ipnsKey != ""),
+		api:               f.api,
+		opt:               f.opt,
+		lastPersistedHash: hash,
+		hash:              hash,
+		ipnsPath:          ipnsPath,
+		ipnsKey:           ipnsKey,
+		isMFS:             isMFS,
+		isReadOnly:        isEndpointReadOnly || !(isMFS || ipnsKey != ""),
 	}
 
 	if !r.isReadOnly {
-		// Persist Fs changes
+		// Persist Fs changes periodically
+		r.periodicPersist()
 
-		if r.isMFS {
-			// periodically for MFS only
-			r.periodicPersist()
-		}
-
-		// on program exit
+		// Persist Fs changes on program exit
 		atexit.Register(r.persist)
 	}
 	return &r, nil
 }
 
-// Persist root to MFS or IPNS
+// Persist root to MFS or IPNS and pin hash
 func (r *Root) persist() {
-	r.Lock()
-	defer r.Unlock()
-	if r.hash == r.initialHash {
+	r.bgPersisting.Wait()
+	r.RLock()
+	defer r.RUnlock()
+	if r.hash == r.lastPersistedHash {
 		return
 	}
-	if r.isMFS {
-		r.persistToMFS()
-	} else if r.ipnsKey != "" {
-		r.persistToIPNS()
+
+	r.bgPersisting.Add(1)
+	defer r.bgPersisting.Done()
+
+	var err error
+
+	// Update pinned hash
+	err = updatePin(r.api, r.lastPersistedHash, r.hash)
+	if err != nil {
+		panic(err)
 	}
+
+	// Update persisted hash
+	if r.isMFS {
+		err = persistToMFS(r.api, r.lastPersistedHash, r.hash)
+	} else if r.ipnsKey != "" {
+		err = persistToIPNS(r.api, r.lastPersistedHash, r.hash, r.ipnsPath, r.ipnsKey)
+	}
+	if err != nil {
+		panic(err)
+	}
+	r.lastPersistedHash = r.hash
 }
 
 // Persist periodically
 func (r *Root) periodicPersist() {
-	nextTime := time.Now().Add(PersistPeriod)
-	time.Sleep(time.Until(nextTime))
-	r.persist()
-	go r.periodicPersist()
+	duration := time.Duration(r.opt.UpdatePeriod)
+	time.AfterFunc(duration, func() {
+		r.persist()
+		go r.periodicPersist()
+	})
 }
 
 func listChangedPath(changes []api.ObjectChange) (paths []string) {
@@ -135,24 +158,25 @@ func listChangedPath(changes []api.ObjectChange) (paths []string) {
 }
 
 // Persist modified IPFS DAG to IPFS MFS
-func (r *Root) persistToMFS() {
-	stat, err := r.api.FilesStat("/")
+func persistToMFS(api *api.Client, lastPersistedHash string, newHash string) error {
+	stat, err := api.FilesStat("/")
 	if err != nil {
-		panic(err)
+		return errors.Wrap(err, "could not obtain stats for MFS root directory")
 	}
 
 	// List differences before and after rclone operations
-	diff, err := r.api.ObjectDiff(r.initialHash, r.hash)
+	diff, err := api.ObjectDiff(lastPersistedHash, newHash)
 	if err != nil {
-		panic(err)
+		return err
 	}
 
-	if stat.Hash != r.initialHash {
+	// MFS has been modified outside rclone
+	if stat.Hash != lastPersistedHash {
 		// Detect incompatible changes (abort if any)
 
-		externalDiff, err := r.api.ObjectDiff(stat.Hash, r.initialHash)
+		externalDiff, err := api.ObjectDiff(stat.Hash, lastPersistedHash)
 		if err != nil {
-			panic(err)
+			return err
 		}
 
 		externalChangedPaths := listChangedPath(externalDiff.Changes)
@@ -162,7 +186,7 @@ func (r *Root) persistToMFS() {
 			for _, localChangedPath := range localChangedPaths {
 				if strings.HasPrefix(externalChangedPath, localChangedPath) ||
 					strings.HasPrefix(localChangedPath, externalChangedPath) {
-					panic("Error: concurrent modification of the IPFS MFS. Consistency not guaranteed.")
+					return errors.New("Error: concurrent modification of the IPFS MFS. Consistency not guaranteed.")
 				}
 			}
 		}
@@ -171,48 +195,58 @@ func (r *Root) persistToMFS() {
 	// Persist changes to IPFS MFS
 	for _, change := range diff.Changes {
 		filePath := "/" + change.Path
+		var err error
 		if change.Before != nil {
-			err := r.api.FilesRm(filePath)
-			if err != nil {
-				panic(err)
-			}
+			err = api.FilesRm(filePath)
 		}
 		if change.After != nil {
 			absolutePath := "/ipfs/" + change.After["/"]
-			err := r.api.FilesCp(absolutePath, filePath)
-			if err != nil {
-				panic(err)
-			}
+			err = api.FilesCp(absolutePath, filePath)
+		}
+		if err != nil {
+			return errors.Wrap(err, "could not update MFS at path '"+filePath+"'")
 		}
 	}
-	fs.LogPrint(fs.LogLevelDebug, "Updated IPFS MFS to '/ipfs/"+r.hash+"'.")
-
-	// Update hash from MFS in case it changed
-	stat, err = r.api.FilesStat("/")
-	if err != nil {
-		panic(err)
-	}
-	r.hash = stat.Hash
-
-	r.initialHash = r.hash
+	fs.LogPrint(fs.LogLevelDebug, "Updated IPFS MFS to '/ipfs/"+newHash+"'.")
+	return nil
 }
 
 // Persist modified IPFS DAG to IPNS
-func (r *Root) persistToIPNS() {
-	result, err := r.api.NameResolve(r.ipnsPath)
+func persistToIPNS(api *api.Client, lastPersistedHash string, newHash string, ipnsPath string, ipnsKey string) error {
+	result, err := api.NameResolve(ipnsPath)
 	if err != nil {
-		panic(err)
+		return errors.Wrap(err, "could not resolve IPNS path '"+ipnsPath+"'")
 	}
 	_, ipfsHash := path.Split(result.Path)
-	if r.initialHash != ipfsHash {
-		panic("Error: concurrent modification of the IPFS IPNS. Consistency not guaranteed.")
+	if lastPersistedHash != ipfsHash {
+		return errors.New("concurrent modification of the IPFS IPNS. Consistency not guaranteed.")
 	}
 
-	err = r.api.NamePublish(r.hash, r.ipnsKey)
+	err = api.NamePublish(newHash, ipnsKey)
 	if err != nil {
-		panic(err)
+		return errors.Wrap(err, "could not update IPNS path '"+ipnsPath+"'")
 	}
-	fs.LogPrint(fs.LogLevelDebug, "Updated IPNS '"+r.ipnsPath+"' to path '/ipfs/"+r.hash+"'.")
+	fs.LogPrint(fs.LogLevelDebug, "Updated IPNS '"+ipnsPath+"' to path '/ipfs/"+newHash+"'.")
+	return nil
+}
 
-	r.initialHash = r.hash
+// Pin updated IPFS DAG (un-pin old one)
+func updatePin(client *api.Client, lastPersistedHash string, newHash string) error {
+	// Pin new IPFS root hash
+	err := client.PinAdd(newHash, true)
+	if err != nil {
+		return errors.Wrap(err, "could not pin hash on IPFS endpoint. Consistency not guaranteed.")
+	}
+
+	// Un-pin old IPFS root hash
+	err = client.PinRm(lastPersistedHash)
+	if err != nil {
+		isAlreadyNotPinned := strings.Contains(err.Error(), "not pinned")
+		if !isAlreadyNotPinned {
+			return errors.Wrap(err, "could not un-pin old hash '"+lastPersistedHash+"'.")
+		}
+		// ignore error if hash is already not pinned
+	}
+	fs.LogPrint(fs.LogLevelDebug, "Updated pin '"+lastPersistedHash+"' to path '"+newHash+"'.")
+	return nil
 }
